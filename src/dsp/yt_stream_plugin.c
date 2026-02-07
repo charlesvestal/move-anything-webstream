@@ -153,6 +153,13 @@ static void stop_stream(yt_instance_t *inst) {
     inst->pipe_fd = -1;
 }
 
+static void clear_ring(yt_instance_t *inst) {
+    if (!inst) return;
+    inst->read_pos = 0;
+    inst->write_pos = 0;
+    inst->count = 0;
+}
+
 static int start_stream(yt_instance_t *inst) {
     char cmd[4096];
 
@@ -398,7 +405,7 @@ static void pump_pipe(yt_instance_t *inst) {
             inst->stream_eof = true;
             set_error(inst, "stream ended");
             stop_stream(inst);
-            inst->restart_countdown = RESTART_RETRY_BLOCKS;
+            inst->restart_countdown = 0;
             break;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -407,7 +414,7 @@ static void pump_pipe(yt_instance_t *inst) {
         inst->stream_eof = true;
         set_error(inst, "stream read error");
         stop_stream(inst);
-        inst->restart_countdown = RESTART_RETRY_BLOCKS;
+        inst->restart_countdown = 0;
         break;
     }
 }
@@ -470,15 +477,17 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             inst->stream_eof = false;
             inst->restart_countdown = 0;
             stop_stream(inst);
+            clear_ring(inst);
             clear_error(inst);
             return;
         }
 
         snprintf(inst->stream_url, sizeof(inst->stream_url), "%s", val);
         inst->stream_eof = false;
-        if (start_stream(inst) != 0) {
-            inst->restart_countdown = RESTART_RETRY_BLOCKS;
-        }
+        inst->restart_countdown = 0;
+        stop_stream(inst);
+        clear_ring(inst);
+        clear_error(inst);
         return;
     }
 
@@ -639,11 +648,16 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         return;
     }
 
+    if (inst->stream_eof) {
+        return;
+    }
+
     if (!inst->pipe) {
         if (inst->restart_countdown > 0) {
             inst->restart_countdown--;
         } else if (start_stream(inst) != 0) {
-            inst->restart_countdown = RESTART_RETRY_BLOCKS;
+            inst->stream_eof = true;
+            inst->restart_countdown = 0;
         }
     }
 
