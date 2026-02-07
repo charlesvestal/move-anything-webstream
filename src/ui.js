@@ -7,6 +7,7 @@ import {
 } from '/data/UserData/move-anything/shared/text_entry.mjs';
 
 import {
+  MidiNoteOn,
   MoveShift,
   MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob7, MoveKnob8,
   MoveKnob1Touch, MoveKnob2Touch, MoveKnob3Touch, MoveKnob7Touch, MoveKnob8Touch
@@ -64,27 +65,27 @@ function setPendingKnobAction(cc, action, prompt) {
 
 function runKnobAction(action) {
   if (action === 'play_pause') {
-    host_module_set_param('play_pause_toggle', '1');
+    host_module_set_param('play_pause_step', 'trigger');
     statusMessage = 'Toggling pause...';
     return;
   }
   if (action === 'rewind_15') {
-    host_module_set_param('seek_delta_seconds', '-15');
+    host_module_set_param('rewind_15_step', 'trigger');
     statusMessage = 'Rewind 15s...';
     return;
   }
   if (action === 'forward_15') {
-    host_module_set_param('seek_delta_seconds', '15');
+    host_module_set_param('forward_15_step', 'trigger');
     statusMessage = 'Forward 15s...';
     return;
   }
   if (action === 'stop') {
-    host_module_set_param('stop', '1');
+    host_module_set_param('stop_step', 'trigger');
     statusMessage = 'Stopping...';
     return;
   }
   if (action === 'restart') {
-    host_module_set_param('restart', '1');
+    host_module_set_param('restart_step', 'trigger');
     statusMessage = 'Restarting...';
   }
 }
@@ -290,28 +291,30 @@ globalThis.onMidiMessageInternal = function (data) {
   const cc = data[1];
   const val = data[2];
 
-  if (status !== 0xB0) return;
+  if (status === MidiNoteOn && val > 0) {
+    if (cc === MoveKnob1Touch) {
+      setPendingKnobAction(MoveKnob1, 'play_pause', streamStatus === 'paused' ? 'Resume?' : 'Pause?');
+      return;
+    }
+    if (cc === MoveKnob2Touch) {
+      setPendingKnobAction(MoveKnob2, 'rewind_15', 'Rewind 15s?');
+      return;
+    }
+    if (cc === MoveKnob3Touch) {
+      setPendingKnobAction(MoveKnob3, 'forward_15', 'Forward 15s?');
+      return;
+    }
+    if (cc === MoveKnob7Touch) {
+      setPendingKnobAction(MoveKnob7, 'stop', 'Stop stream?');
+      return;
+    }
+    if (cc === MoveKnob8Touch) {
+      setPendingKnobAction(MoveKnob8, 'restart', 'Start over?');
+      return;
+    }
+  }
 
-  if (cc === MoveKnob1Touch && val > 0) {
-    setPendingKnobAction(MoveKnob1, 'play_pause', streamStatus === 'paused' ? 'Resume?' : 'Pause?');
-    return;
-  }
-  if (cc === MoveKnob2Touch && val > 0) {
-    setPendingKnobAction(MoveKnob2, 'rewind_15', 'Rewind 15s?');
-    return;
-  }
-  if (cc === MoveKnob3Touch && val > 0) {
-    setPendingKnobAction(MoveKnob3, 'forward_15', 'Forward 15s?');
-    return;
-  }
-  if (cc === MoveKnob7Touch && val > 0) {
-    setPendingKnobAction(MoveKnob7, 'stop', 'Stop stream?');
-    return;
-  }
-  if (cc === MoveKnob8Touch && val > 0) {
-    setPendingKnobAction(MoveKnob8, 'restart', 'Start over?');
-    return;
-  }
+  if (status !== 0xB0) return;
 
   if (cc === MoveKnob1 || cc === MoveKnob2 || cc === MoveKnob3 || cc === MoveKnob7 || cc === MoveKnob8) {
     const delta = decodeDelta(val);
