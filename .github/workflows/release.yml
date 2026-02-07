@@ -29,13 +29,19 @@ jobs:
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           REL_VERSION=$(jq -r '.version' release.json)
           EXPECTED_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${TAG_VERSION}/yt-module.tar.gz"
+          EXPECTED_URL_CORE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${TAG_VERSION}/yt-module-core.tar.gz"
           REL_URL=$(jq -r '.download_url' release.json)
+          REL_URL_CORE=$(jq -r '.download_url_core // empty' release.json)
           if [ "$REL_VERSION" != "$TAG_VERSION" ]; then
             echo "ERROR: release.json version ($REL_VERSION) does not match tag version ($TAG_VERSION)"
             exit 1
           fi
           if [ "$REL_URL" != "$EXPECTED_URL" ]; then
             echo "ERROR: release.json download_url ($REL_URL) does not match expected ($EXPECTED_URL)"
+            exit 1
+          fi
+          if [ -n "$REL_URL_CORE" ] && [ "$REL_URL_CORE" != "$EXPECTED_URL_CORE" ]; then
+            echo "ERROR: release.json download_url_core ($REL_URL_CORE) does not match expected ($EXPECTED_URL_CORE)"
             exit 1
           fi
 
@@ -46,11 +52,13 @@ jobs:
         run: |
           ./scripts/build-deps.sh
           docker build -t module-builder -f scripts/Dockerfile .
-          docker run --rm -v "$PWD:/build" -w /build module-builder ./scripts/build.sh
+          docker run --rm -v "$PWD:/build" -w /build module-builder ./scripts/build-release-assets.sh
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/yt-module.tar.gz
+          files: |
+            dist/yt-module.tar.gz
+            dist/yt-module-core.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

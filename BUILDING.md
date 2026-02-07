@@ -19,10 +19,14 @@ Build output in `dist/yt/`:
 - `bin/deno` (optional)
 - `bin/ffmpeg` (optional)
 - `bin/ffprobe` (optional)
+- `THIRD_PARTY_NOTICES.md`
+- `licenses/`
+- `THIRD_PARTY_MANIFEST.json` (if generated)
 
 Release tarball:
 
 - `dist/yt-module.tar.gz`
+- `dist/yt-module-core.tar.gz` (core-only variant, for release builds)
 
 ## 1) Build yt-dlp for Move
 
@@ -97,6 +101,7 @@ This script creates:
 - `build/deps/bin/deno`
 - `build/deps/bin/ffmpeg`
 - `build/deps/bin/ffprobe`
+- `build/deps/manifest.json` (version/source/checksum metadata)
 
 ## 5) Build module (v2 plugin)
 
@@ -109,7 +114,22 @@ What it does:
 - Cross-compiles `src/dsp/yt_stream_plugin.c` to `dsp.so` for `aarch64`
 - Packages module files to `dist/yt/`
 - If `build/deps/bin` exists, bundles runtime binaries into `dist/yt/bin/`
-- Creates `dist/yt-module.tar.gz`
+- Copies third-party notices/licenses into the module
+- Creates `dist/yt-module.tar.gz` by default
+
+Force profile selection:
+
+```bash
+BUNDLE_RUNTIME=with-deps ./scripts/build.sh
+BUNDLE_RUNTIME=core-only ./scripts/build.sh
+```
+
+Build both release assets:
+
+```bash
+./scripts/build-deps.sh
+./scripts/build-release-assets.sh
+```
 
 ## 6) Deploy to Move
 
@@ -153,3 +173,4 @@ file dist/yt/dsp.so
 - The plugin is search-driven (it does not auto-start a hardcoded URL on load).
 - Runtime network and YouTube behavior can affect startup latency.
 - `yt-dlp`/site extraction behavior may change over time; rebuild dependencies as needed.
+- For distribution terms and dependency licenses, see `THIRD_PARTY_NOTICES.md`.

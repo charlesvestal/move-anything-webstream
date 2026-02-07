@@ -1,6 +1,8 @@
 # YT Stream Module (Move Anything)
 
-Experimental v2 sound-generator module for YouTube search and streamed audio playback.
+Experimental v2 sound-generator module for streamed audio playback via `yt-dlp` backends.
+
+Third-party, unsupported community module. Not affiliated with or endorsed by Ableton or YouTube.
 
 ## Current Behavior
 
@@ -20,6 +22,16 @@ Experimental v2 sound-generator module for YouTube search and streamed audio pla
 ./scripts/build.sh
 ```
 
+Release assets (both variants):
+
+```bash
+./scripts/build-deps.sh
+./scripts/build-release-assets.sh
+```
+
+- `dist/yt-module.tar.gz` bundles runtime dependencies.
+- `dist/yt-module-core.tar.gz` is core-only (user supplies `yt-dlp`/`deno`/`ffmpeg`).
+
 ## Install
 
 ```bash
@@ -29,3 +41,9 @@ Experimental v2 sound-generator module for YouTube search and streamed audio pla
 ## Dependency Build Documentation
 
 See `BUILDING.md` for detailed, reproducible steps for `yt-dlp`, `deno`, and `ffmpeg`.
+
+## Notices
+
+- Third-party notices: `THIRD_PARTY_NOTICES.md`
+- License copies: `licenses/`
+- Users are responsible for complying with source-platform terms and content rights.

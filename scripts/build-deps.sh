@@ -6,6 +6,7 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 OUT_DIR="$REPO_ROOT/build/deps/bin"
 WORK_DIR="$REPO_ROOT/build/deps/work"
+MANIFEST_PATH="$REPO_ROOT/build/deps/manifest.json"
 
 mkdir -p "$OUT_DIR" "$WORK_DIR"
 
@@ -45,14 +46,16 @@ print(data['tag_name'])
 PY
 )"
 fi
-curl -fL -o "$WORK_DIR/deno.zip" "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-aarch64-unknown-linux-gnu.zip"
+DENO_URL="https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-aarch64-unknown-linux-gnu.zip"
+curl -fL -o "$WORK_DIR/deno.zip" "$DENO_URL"
 unzip -o "$WORK_DIR/deno.zip" -d "$WORK_DIR/deno" >/dev/null
 cp "$WORK_DIR/deno/deno" "$OUT_DIR/deno"
 chmod +x "$OUT_DIR/deno"
 
 
 echo "=== Downloading ffmpeg (yt-dlp arm64 build) ==="
-curl -fL -o "$WORK_DIR/ffmpeg.tar.xz" "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+FFMPEG_URL="https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+curl -fL -o "$WORK_DIR/ffmpeg.tar.xz" "$FFMPEG_URL"
 rm -rf "$WORK_DIR/ffmpeg-extract"
 mkdir -p "$WORK_DIR/ffmpeg-extract"
 tar -xJf "$WORK_DIR/ffmpeg.tar.xz" -C "$WORK_DIR/ffmpeg-extract"
@@ -65,6 +68,69 @@ cp "$FF_DIR/bin/ffmpeg" "$OUT_DIR/ffmpeg"
 cp "$FF_DIR/bin/ffprobe" "$OUT_DIR/ffprobe"
 chmod +x "$OUT_DIR/ffmpeg" "$OUT_DIR/ffprobe"
 
+echo "=== Writing third-party dependency manifest ==="
+YTDLP_COMMIT="$(cd "$YTDLP_DIR" && git rev-parse HEAD 2>/dev/null || true)"
+YTDLP_VERSION_STR="$("$OUT_DIR/yt-dlp" --version 2>/dev/null | head -n1 | tr -d '\r')"
+DENO_VERSION_STR="$DENO_VERSION"
+FFMPEG_VERSION_STR="$(basename "$FF_DIR")"
+python3 - "$OUT_DIR" "$MANIFEST_PATH" "$YTDLP_COMMIT" "$DENO_VERSION" "$DENO_URL" "$FFMPEG_URL" "$YTDLP_VERSION_STR" "$DENO_VERSION_STR" "$FFMPEG_VERSION_STR" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+out_dir, manifest_path, ytdlp_commit, deno_tag, deno_url, ffmpeg_url, ytdlp_version, deno_version, ffmpeg_version = sys.argv[1:]
+
+def sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+manifest = {
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "artifacts": {
+        "yt-dlp": {
+            "version": ytdlp_version,
+            "source_repo": "https://github.com/yt-dlp/yt-dlp",
+            "source_ref": ytdlp_commit,
+            "license": "Unlicense",
+            "sha256": sha256(os.path.join(out_dir, "yt-dlp")),
+        },
+        "deno": {
+            "version": deno_version,
+            "source_url": deno_url,
+            "source_tag": deno_tag,
+            "license": "MIT",
+            "sha256": sha256(os.path.join(out_dir, "deno")),
+        },
+        "ffmpeg": {
+            "version": ffmpeg_version,
+            "source_url": ffmpeg_url,
+            "license": "GPL-3.0-or-later (build-dependent)",
+            "sha256": sha256(os.path.join(out_dir, "ffmpeg")),
+        },
+        "ffprobe": {
+            "version": ffmpeg_version,
+            "source_url": ffmpeg_url,
+            "license": "GPL-3.0-or-later (build-dependent)",
+            "sha256": sha256(os.path.join(out_dir, "ffprobe")),
+        },
+    },
+}
+
+os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+with open(manifest_path, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
+    f.write("\n")
+PY
+
 echo "=== Dependency build complete ==="
 ls -lh "$OUT_DIR"
 file "$OUT_DIR/yt-dlp" "$OUT_DIR/deno" "$OUT_DIR/ffmpeg" "$OUT_DIR/ffprobe" || true
+echo "Manifest: $MANIFEST_PATH"
