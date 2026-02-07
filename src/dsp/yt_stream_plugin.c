@@ -45,6 +45,8 @@ typedef struct {
     size_t read_pos;
     size_t write_pos;
     size_t count;
+    bool has_pending_byte;
+    uint8_t pending_byte;
 
     float gain;
 
@@ -122,6 +124,31 @@ static void sanitize_query(const char *in, char *out, size_t out_len) {
     }
 }
 
+static void sanitize_display_text(char *s) {
+    size_t i;
+    size_t j = 0;
+    bool prev_space = true;
+
+    if (!s) return;
+
+    for (i = 0; s[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)s[i];
+        char out_c = (c >= 32 && c <= 126) ? (char)c : ' ';
+
+        if (out_c == ' ') {
+            if (prev_space) continue;
+            prev_space = true;
+            s[j++] = out_c;
+        } else {
+            prev_space = false;
+            s[j++] = out_c;
+        }
+    }
+
+    while (j > 0 && s[j - 1] == ' ') j--;
+    s[j] = '\0';
+}
+
 static void ring_push(yt_instance_t *inst, const int16_t *samples, size_t n) {
     size_t i;
     for (i = 0; i < n; i++) {
@@ -158,6 +185,8 @@ static void clear_ring(yt_instance_t *inst) {
     inst->read_pos = 0;
     inst->write_pos = 0;
     inst->count = 0;
+    inst->has_pending_byte = false;
+    inst->pending_byte = 0;
 }
 
 static int start_stream(yt_instance_t *inst) {
@@ -172,8 +201,8 @@ static int start_stream(yt_instance_t *inst) {
         "-f \"ba[protocol^=http][protocol!*=dash]/ba\" -g \"%s\")\" && "
         "exec \"%s/bin/ffmpeg\" -hide_banner -loglevel error "
         "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 "
-        "-i \"$U\" -vn -sn -dn -f s16le -ac 2 -ar 44100 pipe:1'",
-        inst->module_dir, inst->stream_url, inst->module_dir);
+        "-i \"$U\" -vn -sn -dn -af \"aresample=%d\" -f s16le -ac 2 -ar %d pipe:1'",
+        inst->module_dir, inst->stream_url, inst->module_dir, MOVE_SAMPLE_RATE, MOVE_SAMPLE_RATE);
 
     inst->pipe = popen(cmd, "r");
     if (!inst->pipe) {
@@ -204,7 +233,7 @@ static int start_stream(yt_instance_t *inst) {
 }
 
 static int parse_search_line(const char *line_in, search_result_t *out) {
-    char line[1024];
+    char line[4096];
     char *saveptr = NULL;
     char *id;
     char *title;
@@ -242,6 +271,9 @@ static int parse_search_line(const char *line_in, search_result_t *out) {
     snprintf(out->title, sizeof(out->title), "%s", title);
     snprintf(out->channel, sizeof(out->channel), "%s", channel ? channel : "");
     snprintf(out->duration, sizeof(out->duration), "%s", duration ? duration : "");
+    sanitize_display_text(out->title);
+    sanitize_display_text(out->channel);
+    sanitize_display_text(out->duration);
     snprintf(out->url, sizeof(out->url), "https://www.youtube.com/watch?v=%s", out->id);
     return 0;
 }
@@ -255,7 +287,7 @@ static int run_search_command(const yt_instance_t *inst,
     char clean_query[SEARCH_QUERY_MAX];
     char cmd[4096];
     FILE *fp;
-    char line[1024];
+    char line[4096];
     int count = 0;
     int rc;
 
@@ -388,15 +420,33 @@ static int start_search_async(yt_instance_t *inst, const char *query) {
 
 static void pump_pipe(yt_instance_t *inst) {
     uint8_t buf[4096];
+    uint8_t merged[4097];
     int16_t samples[2048];
 
     while (inst->pipe && !inst->stream_eof) {
         ssize_t n = read(inst->pipe_fd, buf, sizeof(buf));
         if (n > 0) {
-            size_t sample_count = (size_t)n / sizeof(int16_t);
-            memcpy(samples, buf, sample_count * sizeof(int16_t));
+            size_t merged_bytes = 0;
+            size_t sample_count;
+
+            if (inst->has_pending_byte) {
+                merged[merged_bytes++] = inst->pending_byte;
+                inst->has_pending_byte = false;
+            }
+
+            memcpy(merged + merged_bytes, buf, (size_t)n);
+            merged_bytes += (size_t)n;
+
+            if ((merged_bytes & 1U) != 0U) {
+                inst->pending_byte = merged[merged_bytes - 1];
+                inst->has_pending_byte = true;
+                merged_bytes--;
+            }
+
+            sample_count = merged_bytes / sizeof(int16_t);
+            memcpy(samples, merged, sample_count * sizeof(int16_t));
             ring_push(inst, samples, sample_count);
-            if (sample_count < (sizeof(buf) / sizeof(int16_t))) {
+            if ((size_t)n < sizeof(buf)) {
                 break;
             }
             continue;
@@ -408,7 +458,7 @@ static void pump_pipe(yt_instance_t *inst) {
             inst->restart_countdown = 0;
             break;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             break;
         }
         inst->stream_eof = true;

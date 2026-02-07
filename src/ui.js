@@ -34,6 +34,14 @@ let menuStack = createMenuStack();
 let tickCounter = 0;
 let needsRedraw = true;
 
+function cleanLabel(text, maxLen = 24) {
+  let s = String(text || '');
+  s = s.replace(/[^\x20-\x7E]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!s) s = '(untitled)';
+  if (s.length > maxLen) s = `${s.slice(0, Math.max(0, maxLen - 1))}…`;
+  return s;
+}
+
 function clampSelectedIndex() {
   const current = menuStack.current();
   if (!current || !current.items || current.items.length === 0) {
@@ -56,7 +64,7 @@ function buildRootItems() {
   const count = Math.min(results.length, MAX_MENU_RESULTS);
   for (let i = 0; i < count; i++) {
     const row = results[i];
-    const title = row?.title || `Result ${i + 1}`;
+    const title = cleanLabel(row?.title || `Result ${i + 1}`);
     items.push(
       createAction(title, () => {
         if (!row || !row.url) return;
@@ -203,6 +211,7 @@ globalThis.tick = function () {
       rebuildMenu();
     }
 
+    clear_screen();
     drawStackMenu({
       stack: menuStack,
       state: menuState,
