@@ -1,18 +1,17 @@
 # YT Stream Module (Move Anything)
 
-Experimental v2 sound-generator module that starts a YouTube audio stream on load.
+Experimental v2 sound-generator module for YouTube search and streamed audio playback.
 
 ## Current Behavior
 
 - Exports a **v2 DSP plugin** (`move_plugin_init_v2`)
-- On instance creation, launches a pipeline:
-  - `yt-dlp` resolves an audio URL for a test video
-  - `ffmpeg` decodes to 44.1kHz stereo `s16le`
-- Audio is buffered and emitted in `render_block`
-
-Default test URL:
-
-- `https://www.youtube.com/watch?v=xvFZjo5PgG0`
+- Uses menu UI with:
+  - `[New Search...]`
+  - `[Previous searches]`
+  - search results list
+- Starts streaming when a result is selected
+- Uses `yt-dlp` + `ffmpeg` pipeline to decode to 44.1kHz stereo `s16le`
+- Supports transport controls (play/pause, seek ±15s, stop, restart) via mapped knobs
 
 ## Build
 

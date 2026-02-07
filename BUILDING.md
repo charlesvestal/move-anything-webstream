@@ -150,6 +150,6 @@ file dist/yt/dsp.so
 
 ## Notes
 
-- The plugin is currently hard-wired to a test URL via module defaults.
+- The plugin is search-driven (it does not auto-start a hardcoded URL on load).
 - Runtime network and YouTube behavior can affect startup latency.
 - `yt-dlp`/site extraction behavior may change over time; rebuild dependencies as needed.

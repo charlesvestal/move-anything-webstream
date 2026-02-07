@@ -1,3 +1,6 @@
+import * as std from 'std';
+import * as os from 'os';
+
 import {
   openTextEntry,
   isTextEntryActive,
@@ -21,6 +24,8 @@ import { createMenuStack } from '/data/UserData/move-anything/shared/menu_stack.
 import { drawStackMenu } from '/data/UserData/move-anything/shared/menu_render.mjs';
 
 const MAX_MENU_RESULTS = 20;
+const MAX_SEARCH_HISTORY = 20;
+const SEARCH_HISTORY_PATH = '/data/UserData/move-anything/yt_search_history.json';
 const SPINNER = ['-', '/', '|', '\\'];
 
 let searchQuery = '';
@@ -30,6 +35,7 @@ let streamStatus = 'stopped';
 let selectedIndex = 0;
 let statusMessage = 'Click: select';
 let results = [];
+let searchHistory = [];
 let shiftHeld = false;
 
 let menuState = createMenuState();
@@ -51,6 +57,7 @@ function cleanLabel(text, maxLen = 24) {
 
 function currentActivityLabel() {
   if (searchStatus === 'searching') return 'Searching';
+  if (searchStatus === 'queued') return 'Queued';
   if (streamStatus === 'loading') return 'Loading';
   if (streamStatus === 'buffering') return 'Buffering';
   if (streamStatus === 'seeking') return 'Seeking';
@@ -102,10 +109,131 @@ function clampSelectedIndex() {
   }
 }
 
+function addSearchToHistory(query) {
+  const q = String(query || '').trim();
+  if (!q) return;
+  searchHistory = searchHistory.filter((item) => item !== q);
+  searchHistory.unshift(q);
+  if (searchHistory.length > MAX_SEARCH_HISTORY) {
+    searchHistory = searchHistory.slice(0, MAX_SEARCH_HISTORY);
+  }
+}
+
+function writeTextFile(path, content) {
+  let file;
+  try {
+    file = std.open(path, 'w');
+    if (!file) return false;
+    file.puts(content);
+    file.close();
+    return true;
+  } catch (e) {
+    if (file) {
+      try { file.close(); } catch (_) {}
+    }
+    return false;
+  }
+}
+
+function loadSearchHistoryFromDisk() {
+  try {
+    const raw = std.loadFile(SEARCH_HISTORY_PATH);
+    if (!raw) {
+      searchHistory = [];
+      return;
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      searchHistory = [];
+      return;
+    }
+
+    const next = [];
+    for (const entry of parsed) {
+      const q = String(entry || '').trim();
+      if (!q) continue;
+      if (next.includes(q)) continue;
+      next.push(q);
+      if (next.length >= MAX_SEARCH_HISTORY) break;
+    }
+    searchHistory = next;
+  } catch (e) {
+    searchHistory = [];
+  }
+}
+
+function saveSearchHistoryToDisk() {
+  const payload = `${JSON.stringify(searchHistory.slice(0, MAX_SEARCH_HISTORY))}\n`;
+  const tmpPath = `${SEARCH_HISTORY_PATH}.tmp`;
+
+  if (writeTextFile(tmpPath, payload)) {
+    if (typeof os.rename === 'function') {
+      const rc = os.rename(tmpPath, SEARCH_HISTORY_PATH);
+      if (rc === 0) return;
+    }
+
+    writeTextFile(SEARCH_HISTORY_PATH, payload);
+    if (typeof os.remove === 'function') {
+      os.remove(tmpPath);
+    }
+    return;
+  }
+
+  writeTextFile(SEARCH_HISTORY_PATH, payload);
+}
+
+function submitSearch(query) {
+  const q = String(query || '').trim();
+  if (!q) return;
+
+  addSearchToHistory(q);
+  saveSearchHistoryToDisk();
+  results = [];
+  searchCount = 0;
+  selectedIndex = 0;
+  menuState.selectedIndex = 0;
+  statusMessage = 'Searching...';
+  rebuildMenu();
+
+  host_module_set_param('search_query', q);
+}
+
+function openSearchHistoryMenu() {
+  loadSearchHistoryFromDisk();
+
+  const items = [];
+  if (searchHistory.length === 0) {
+    items.push(createAction('(No previous searches)', () => {}));
+  } else {
+    for (const query of searchHistory) {
+      const label = cleanLabel(query, 24);
+      items.push(createAction(label, () => {
+        while (menuStack.depth() > 1) {
+          menuStack.pop();
+        }
+        menuState.selectedIndex = 0;
+        submitSearch(query);
+      }));
+    }
+  }
+
+  menuStack.push({
+    title: 'Previous',
+    items,
+    selectedIndex: 0
+  });
+  menuState.selectedIndex = 0;
+  needsRedraw = true;
+}
+
 function buildRootItems() {
   const items = [
     createAction('[New Search...]', () => {
       openSearchPrompt();
+    }),
+    createAction('[Previous searches]', () => {
+      openSearchHistoryMenu();
     })
   ];
 
@@ -169,12 +297,16 @@ function refreshState() {
 
     if (searchStatus === 'searching') {
       statusMessage = 'Searching...';
+    } else if (searchStatus === 'queued') {
+      statusMessage = 'Search queued...';
     } else if (searchStatus === 'done') {
       statusMessage = `${searchCount} results`;
     } else if (searchStatus === 'no_results') {
       statusMessage = 'No results';
     } else if (searchStatus === 'error') {
       statusMessage = 'Search failed';
+    } else if (searchStatus === 'busy') {
+      statusMessage = 'Search busy';
     }
   }
 
@@ -201,15 +333,7 @@ function openSearchPrompt() {
         needsRedraw = true;
         return;
       }
-
-      results = [];
-      searchCount = 0;
-      selectedIndex = 0;
-      menuState.selectedIndex = 0;
-      statusMessage = 'Searching...';
-      rebuildMenu();
-
-      host_module_set_param('search_query', query);
+      submitSearch(query);
     },
     onCancel: () => {
       statusMessage = 'Search cancelled';
@@ -234,6 +358,7 @@ globalThis.init = function () {
   selectedIndex = 0;
   statusMessage = 'Click: select';
   results = [];
+  loadSearchHistoryFromDisk();
   shiftHeld = false;
 
   menuState = createMenuState();

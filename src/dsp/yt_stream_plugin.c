@@ -25,8 +25,11 @@
 #define SEARCH_ID_MAX 32
 #define SEARCH_TEXT_MAX 192
 #define SEARCH_URL_MAX 160
+#define STREAM_URL_MAX 1024
 
 static const host_api_v1_t *g_host = NULL;
+
+static void* search_thread_main(void *arg);
 
 typedef struct {
     char id[SEARCH_ID_MAX];
@@ -38,7 +41,7 @@ typedef struct {
 
 typedef struct {
     char module_dir[512];
-    char stream_url[1024];
+    char stream_url[STREAM_URL_MAX];
     char error_msg[256];
 
     FILE *pipe;
@@ -77,6 +80,8 @@ typedef struct {
     bool search_thread_valid;
     bool search_thread_running;
     char search_query[SEARCH_QUERY_MAX];
+    char queued_search_query[SEARCH_QUERY_MAX];
+    bool queued_search_pending;
     char search_status[24];
     char search_error[256];
     uint64_t search_elapsed_ms;
@@ -208,6 +213,75 @@ static void sanitize_display_text(char *s) {
 
     while (j > 0 && s[j - 1] == ' ') j--;
     s[j] = '\0';
+}
+
+static bool is_allowed_stream_url_char(unsigned char c) {
+    if (isalnum(c)) return true;
+    return c == ':' || c == '/' || c == '?' || c == '&' || c == '=' || c == '%' ||
+           c == '.' || c == '_' || c == '-' || c == '+' || c == '#' || c == '~';
+}
+
+static bool host_is_supported(const char *host) {
+    size_t len;
+    if (!host || host[0] == '\0') return false;
+    if (strcmp(host, "youtube.com") == 0 ||
+        strcmp(host, "www.youtube.com") == 0 ||
+        strcmp(host, "m.youtube.com") == 0 ||
+        strcmp(host, "music.youtube.com") == 0 ||
+        strcmp(host, "youtu.be") == 0 ||
+        strcmp(host, "www.youtu.be") == 0) {
+        return true;
+    }
+    len = strlen(host);
+    if (len > 12 && strcmp(host + len - 12, ".youtube.com") == 0) {
+        return true;
+    }
+    return false;
+}
+
+static bool sanitize_stream_url(const char *in, char *out, size_t out_len) {
+    const char *p;
+    const char *host_start;
+    const char *host_end;
+    size_t host_len;
+    char host[128];
+    size_t i;
+    size_t j = 0;
+
+    if (!in || !out || out_len == 0) return false;
+    if (!(strncmp(in, "https://", 8) == 0 || strncmp(in, "http://", 7) == 0)) {
+        return false;
+    }
+
+    p = strstr(in, "://");
+    if (!p) return false;
+    host_start = p + 3;
+    host_end = host_start;
+    while (*host_end && *host_end != '/' && *host_end != '?' && *host_end != '#') {
+        host_end++;
+    }
+    host_len = (size_t)(host_end - host_start);
+    if (host_len == 0 || host_len >= sizeof(host)) return false;
+    memcpy(host, host_start, host_len);
+    host[host_len] = '\0';
+
+    for (i = 0; host[i] != '\0'; i++) {
+        if (host[i] == ':') {
+            host[i] = '\0'; /* strip optional :port */
+            break;
+        }
+    }
+
+    if (!host_is_supported(host)) return false;
+
+    for (i = 0; in[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (!is_allowed_stream_url_char(c)) return false;
+        if (j + 1 >= out_len) return false;
+        out[j++] = (char)c;
+    }
+    out[j] = '\0';
+    return j > 0;
 }
 
 static uint64_t ring_oldest_abs(const yt_instance_t *inst) {
@@ -480,14 +554,36 @@ static int run_search_command(const yt_instance_t *inst,
     return 0;
 }
 
+/* Caller must hold search_mutex. */
+static int spawn_search_thread_locked(yt_instance_t *inst, const char *query) {
+    if (!inst || !query || query[0] == '\0') return -1;
+
+    snprintf(inst->search_query, sizeof(inst->search_query), "%s", query);
+    inst->search_count = 0;
+    inst->search_elapsed_ms = 0;
+    set_search_status(inst, "searching", "");
+    inst->search_thread_running = true;
+
+    if (pthread_create(&inst->search_thread, NULL, search_thread_main, inst) != 0) {
+        inst->search_thread_running = false;
+        set_search_status(inst, "error", "failed to start search thread");
+        return -1;
+    }
+
+    inst->search_thread_valid = true;
+    return 0;
+}
+
 static void* search_thread_main(void *arg) {
     yt_instance_t *inst = (yt_instance_t *)arg;
     char query[SEARCH_QUERY_MAX];
+    char next_query[SEARCH_QUERY_MAX];
     search_result_t local_results[SEARCH_MAX_RESULTS];
     int local_count = 0;
     char local_err[256] = {0};
     char log_msg[320];
     int rc;
+    int start_next;
     uint64_t start_ms;
     uint64_t elapsed_ms;
 
@@ -528,8 +624,29 @@ static void* search_thread_main(void *arg) {
              local_err[0] ? local_err : "-");
     yt_log(log_msg);
 
-    inst->search_thread_running = false;
+    start_next = 0;
+    next_query[0] = '\0';
+    if (inst->queued_search_pending && inst->queued_search_query[0] != '\0') {
+        snprintf(next_query, sizeof(next_query), "%s", inst->queued_search_query);
+        inst->queued_search_pending = false;
+        inst->queued_search_query[0] = '\0';
+        start_next = 1;
+    } else {
+        inst->search_thread_running = false;
+    }
     pthread_mutex_unlock(&inst->search_mutex);
+
+    if (start_next) {
+        pthread_mutex_lock(&inst->search_mutex);
+        if (spawn_search_thread_locked(inst, next_query) == 0) {
+            snprintf(log_msg,
+                     sizeof(log_msg),
+                     "starting queued search query=%s",
+                     next_query);
+            yt_log(log_msg);
+        }
+        pthread_mutex_unlock(&inst->search_mutex);
+    }
 
     return NULL;
 }
@@ -543,24 +660,13 @@ static int start_search_async(yt_instance_t *inst, const char *query) {
     }
 
     if (inst->search_thread_running) {
-        set_search_status(inst, "busy", "search already running");
-        return -1;
+        snprintf(inst->queued_search_query, sizeof(inst->queued_search_query), "%s", query);
+        inst->queued_search_pending = true;
+        set_search_status(inst, "queued", "search queued");
+        return 1;
     }
 
-    snprintf(inst->search_query, sizeof(inst->search_query), "%s", query);
-    inst->search_count = 0;
-    inst->search_elapsed_ms = 0;
-    set_search_status(inst, "searching", "");
-    inst->search_thread_running = true;
-
-    if (pthread_create(&inst->search_thread, NULL, search_thread_main, inst) != 0) {
-        inst->search_thread_running = false;
-        set_search_status(inst, "error", "failed to start search thread");
-        return -1;
-    }
-
-    inst->search_thread_valid = true;
-    return 0;
+    return spawn_search_thread_locked(inst, query);
 }
 
 static void pump_pipe(yt_instance_t *inst) {
@@ -707,12 +813,18 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     }
 
     if (strcmp(key, "stream_url") == 0) {
+        char clean_url[STREAM_URL_MAX];
         if (val[0] == '\0') {
             stop_everything(inst);
             return;
         }
 
-        snprintf(inst->stream_url, sizeof(inst->stream_url), "%s", val);
+        if (!sanitize_stream_url(val, clean_url, sizeof(clean_url))) {
+            set_error(inst, "invalid stream_url");
+            return;
+        }
+
+        snprintf(inst->stream_url, sizeof(inst->stream_url), "%s", clean_url);
         restart_stream_from_beginning(inst, 0);
         return;
     }

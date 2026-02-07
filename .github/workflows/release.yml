@@ -24,6 +24,21 @@ jobs:
             exit 1
           fi
 
+      - name: Verify release.json metadata
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          REL_VERSION=$(jq -r '.version' release.json)
+          EXPECTED_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${TAG_VERSION}/yt-module.tar.gz"
+          REL_URL=$(jq -r '.download_url' release.json)
+          if [ "$REL_VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: release.json version ($REL_VERSION) does not match tag version ($TAG_VERSION)"
+            exit 1
+          fi
+          if [ "$REL_URL" != "$EXPECTED_URL" ]; then
+            echo "ERROR: release.json download_url ($REL_URL) does not match expected ($EXPECTED_URL)"
+            exit 1
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
