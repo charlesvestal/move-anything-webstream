@@ -7,59 +7,128 @@ import {
 } from '/data/UserData/move-anything/shared/text_entry.mjs';
 
 import {
-  MoveMainKnob,
-  MoveMainButton,
-  MoveBack
+  MoveShift
 } from '/data/UserData/move-anything/shared/constants.mjs';
 
-import { decodeDelta, isCapacitiveTouchMessage } from '/data/UserData/move-anything/shared/input_filter.mjs';
+import { isCapacitiveTouchMessage } from '/data/UserData/move-anything/shared/input_filter.mjs';
+
+import { createAction } from '/data/UserData/move-anything/shared/menu_items.mjs';
+import { createMenuState, handleMenuInput } from '/data/UserData/move-anything/shared/menu_nav.mjs';
+import { createMenuStack } from '/data/UserData/move-anything/shared/menu_stack.mjs';
+import { drawStackMenu } from '/data/UserData/move-anything/shared/menu_render.mjs';
+
+const MAX_MENU_RESULTS = 20;
 
 let searchQuery = '';
 let searchStatus = 'idle';
-let searchError = '';
 let searchCount = 0;
-let searchElapsedMs = 0;
-let selectedIndex = 0;
-let statusMessage = 'Click: search';
 let streamStatus = 'stopped';
-
+let selectedIndex = 0;
+let statusMessage = 'Click: select';
 let results = [];
-let tickCounter = 0;
+let shiftHeld = false;
 
-function truncate(text, maxLen) {
-  if (!text) return '';
-  if (text.length <= maxLen) return text;
-  return text.slice(0, Math.max(0, maxLen - 1)) + '…';
+let menuState = createMenuState();
+let menuStack = createMenuStack();
+
+let tickCounter = 0;
+let needsRedraw = true;
+
+function clampSelectedIndex() {
+  const current = menuStack.current();
+  if (!current || !current.items || current.items.length === 0) {
+    menuState.selectedIndex = 0;
+    return;
+  }
+  if (menuState.selectedIndex < 0) menuState.selectedIndex = 0;
+  if (menuState.selectedIndex >= current.items.length) {
+    menuState.selectedIndex = current.items.length - 1;
+  }
+}
+
+function buildRootItems() {
+  const items = [
+    createAction('[New Search...]', () => {
+      openSearchPrompt();
+    })
+  ];
+
+  const count = Math.min(results.length, MAX_MENU_RESULTS);
+  for (let i = 0; i < count; i++) {
+    const row = results[i];
+    const title = row?.title || `Result ${i + 1}`;
+    items.push(
+      createAction(title, () => {
+        if (!row || !row.url) return;
+        host_module_set_param('stream_url', row.url);
+        statusMessage = 'Loading stream...';
+        needsRedraw = true;
+      })
+    );
+  }
+
+  return items;
+}
+
+function rebuildMenu() {
+  const items = buildRootItems();
+  const current = menuStack.current();
+  if (!current) {
+    menuStack.push({
+      title: 'YT Search',
+      items,
+      selectedIndex: 0
+    });
+    menuState.selectedIndex = 0;
+  } else {
+    current.items = items;
+    clampSelectedIndex();
+  }
+  needsRedraw = true;
 }
 
 function loadResults() {
   const out = [];
-  for (let i = 0; i < searchCount; i++) {
+  for (let i = 0; i < searchCount && i < MAX_MENU_RESULTS; i++) {
     const title = host_module_get_param(`search_result_title_${i}`) || '';
-    const channel = host_module_get_param(`search_result_channel_${i}`) || '';
-    const duration = host_module_get_param(`search_result_duration_${i}`) || '';
     const url = host_module_get_param(`search_result_url_${i}`) || '';
-    out.push({ title, channel, duration, url });
+    out.push({ title, url });
   }
   results = out;
-  if (selectedIndex >= results.length) {
-    selectedIndex = Math.max(0, results.length - 1);
-  }
 }
 
 function refreshState() {
-  const prevStatus = searchStatus;
-  const prevCount = searchCount;
+  const prevSearchStatus = searchStatus;
+  const prevSearchCount = searchCount;
+  const prevStreamStatus = streamStatus;
 
   streamStatus = host_module_get_param('stream_status') || 'stopped';
   searchQuery = host_module_get_param('search_query') || '';
   searchStatus = host_module_get_param('search_status') || 'idle';
-  searchError = host_module_get_param('search_error') || '';
   searchCount = parseInt(host_module_get_param('search_count') || '0', 10) || 0;
-  searchElapsedMs = parseInt(host_module_get_param('search_elapsed_ms') || '0', 10) || 0;
 
-  if (prevStatus !== searchStatus || prevCount !== searchCount) {
+  if (prevSearchStatus !== searchStatus || prevSearchCount !== searchCount) {
     loadResults();
+    rebuildMenu();
+
+    if (searchStatus === 'searching') {
+      statusMessage = 'Searching...';
+    } else if (searchStatus === 'done') {
+      statusMessage = `${searchCount} results`;
+    } else if (searchStatus === 'no_results') {
+      statusMessage = 'No results';
+    } else if (searchStatus === 'error') {
+      statusMessage = 'Search failed';
+    }
+  }
+
+  if (prevStreamStatus !== streamStatus) {
+    if (streamStatus === 'streaming') {
+      statusMessage = 'Playing';
+    } else if (streamStatus === 'eof' || streamStatus === 'stopped') {
+      statusMessage = 'Stopped';
+    }
+    needsRedraw = true;
   }
 }
 
@@ -71,78 +140,49 @@ function openSearchPrompt() {
       const query = (text || '').trim();
       if (!query) {
         statusMessage = 'Search cancelled';
+        needsRedraw = true;
         return;
       }
 
+      results = [];
+      searchCount = 0;
       selectedIndex = 0;
-      statusMessage = `Searching: ${truncate(query, 14)}`;
+      menuState.selectedIndex = 0;
+      statusMessage = 'Searching...';
+      rebuildMenu();
+
       host_module_set_param('search_query', query);
     },
     onCancel: () => {
       statusMessage = 'Search cancelled';
+      needsRedraw = true;
     }
   });
 }
 
-function selectCurrentResult() {
-  if (selectedIndex < 0 || selectedIndex >= results.length) return;
-  const row = results[selectedIndex];
-  if (!row || !row.url) return;
-
-  statusMessage = `Load #${selectedIndex + 1}`;
-  host_module_set_param('stream_url', row.url);
-}
-
-function drawHeader() {
-  clear_screen();
-  print(2, 2, 'YT Stream', 1);
-  fill_rect(0, 11, 128, 1, 1);
-
-  print(2, 14, `Stream: ${truncate(streamStatus, 12)}`, 1);
-
-  const q = searchQuery ? truncate(searchQuery, 16) : '(none)';
-  print(2, 24, `Q: ${q}`, 1);
-
-  const s = `${searchStatus} ${searchElapsedMs}ms`;
-  print(2, 34, `Search: ${truncate(s, 16)}`, 1);
-}
-
-function drawResults() {
-  if (searchStatus === 'searching') {
-    print(2, 45, 'Searching...', 1);
-    return;
-  }
-
-  if (searchStatus === 'error') {
-    print(2, 45, truncate(searchError || 'Search error', 20), 1);
-    return;
-  }
-
-  if (results.length === 0) {
-    print(2, 45, 'No results yet', 1);
-    return;
-  }
-
-  const row = results[selectedIndex];
-  print(2, 45, `${selectedIndex + 1}/${results.length} ${truncate(row.title, 15)}`, 1);
-  print(2, 55, `${truncate(row.channel, 10)} ${truncate(row.duration, 8)}`, 1);
-}
-
-function drawFooter() {
-  fill_rect(0, 62, 128, 1, 1);
+function currentFooter() {
+  if (isTextEntryActive()) return '';
+  if (searchStatus === 'searching') return 'Searching...';
+  if (statusMessage) return statusMessage;
+  return 'Click:select Back:exit';
 }
 
 globalThis.init = function () {
   searchQuery = '';
   searchStatus = 'idle';
-  searchError = '';
   searchCount = 0;
-  searchElapsedMs = 0;
-  selectedIndex = 0;
-  statusMessage = 'Click: search';
   streamStatus = 'stopped';
+  selectedIndex = 0;
+  statusMessage = 'Click: select';
   results = [];
+  shiftHeld = false;
+
+  menuState = createMenuState();
+  menuStack = createMenuStack();
   tickCounter = 0;
+  needsRedraw = true;
+
+  rebuildMenu();
 };
 
 globalThis.tick = function () {
@@ -152,15 +192,25 @@ globalThis.tick = function () {
     return;
   }
 
-  /* Poll host params at ~10Hz to keep UI cheap. */
   tickCounter = (tickCounter + 1) % 6;
   if (tickCounter === 0) {
     refreshState();
   }
 
-  drawHeader();
-  drawResults();
-  drawFooter();
+  if (needsRedraw) {
+    const current = menuStack.current();
+    if (!current) {
+      rebuildMenu();
+    }
+
+    drawStackMenu({
+      stack: menuStack,
+      state: menuState,
+      footer: currentFooter()
+    });
+
+    needsRedraw = false;
+  }
 };
 
 globalThis.onMidiMessageInternal = function (data) {
@@ -170,38 +220,39 @@ globalThis.onMidiMessageInternal = function (data) {
 
   if (isCapacitiveTouchMessage(data)) return;
 
+  if (status !== 0xB0) return;
+
+  if (cc === MoveShift) {
+    shiftHeld = val > 0;
+    return;
+  }
+
   if (isTextEntryActive()) {
     handleTextEntryMidi(data);
     return;
   }
 
-  if (status !== 0xB0) return;
-
-  const isDown = val > 0;
-
-  if (cc === MoveMainKnob) {
-    if (results.length > 0) {
-      const delta = decodeDelta(val);
-      if (delta !== 0) {
-        selectedIndex += delta;
-        if (selectedIndex < 0) selectedIndex = 0;
-        if (selectedIndex >= results.length) selectedIndex = results.length - 1;
-      }
-    }
+  const current = menuStack.current();
+  if (!current) {
+    rebuildMenu();
     return;
   }
 
-  if (cc === MoveMainButton && isDown) {
-    if (results.length > 0 && (searchStatus === 'done' || searchStatus === 'no_results')) {
-      selectCurrentResult();
-    } else {
-      openSearchPrompt();
-    }
-    return;
-  }
+  const result = handleMenuInput({
+    cc,
+    value: val,
+    items: current.items,
+    state: menuState,
+    stack: menuStack,
+    onBack: () => {
+      host_return_to_menu();
+    },
+    shiftHeld
+  });
 
-  if (cc === MoveBack && isDown) {
-    host_return_to_menu();
+  if (result.needsRedraw) {
+    selectedIndex = menuState.selectedIndex;
+    needsRedraw = true;
   }
 };
 
@@ -211,7 +262,7 @@ globalThis.onMidiMessageExternal = function (data) {
   }
 };
 
-/* Also expose chain_ui so shadow component loader can consume this file directly. */
+/* Expose chain_ui for shadow component loader compatibility. */
 globalThis.chain_ui = {
   init: globalThis.init,
   tick: globalThis.tick,
