@@ -2,7 +2,7 @@
   "id": "yt",
   "name": "YT Stream",
   "abbrev": "YT",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Experimental YouTube audio stream generator using yt-dlp + ffmpeg",
   "author": "charlesvestal",
   "license": "MIT",
