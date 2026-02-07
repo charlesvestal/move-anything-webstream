@@ -1,4 +1,9 @@
 {
-  "version": "0.0.1",
-  "download_url": ""
+  "version": "0.1.0",
+  "download_url": "https://github.com/charlesvestal/move-anything-yt/releases/download/v0.1.0/yt-module.tar.gz",
+  "name": "YT Stream",
+  "description": "YouTube audio search and streaming generator with bundled yt-dlp/ffmpeg runtime.",
+  "requires": "",
+  "post_install": "No extra install steps required. Open YT Stream and choose [New Search...] to start playback.",
+  "repo_url": "https://github.com/charlesvestal/move-anything-yt"
 }
