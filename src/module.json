@@ -1,0 +1,35 @@
+{
+  "id": "yt",
+  "name": "YT Stream",
+  "abbrev": "YT",
+  "version": "0.0.1",
+  "description": "Experimental YouTube audio stream generator using yt-dlp + ffmpeg",
+  "author": "charlesvestal",
+  "license": "MIT",
+  "ui": "ui.js",
+  "dsp": "dsp.so",
+  "api_version": 2,
+  "capabilities": {
+    "audio_out": true,
+    "audio_in": false,
+    "midi_in": false,
+    "midi_out": false,
+    "chainable": true,
+    "component_type": "sound_generator",
+    "chain_params": [
+      {
+        "key": "gain",
+        "name": "Gain",
+        "type": "float",
+        "min": 0.0,
+        "max": 2.0,
+        "default": 1.0,
+        "step": 0.05
+      }
+    ]
+  },
+  "defaults": {
+    "test_url": "https://www.youtube.com/watch?v=xvFZjo5PgG0",
+    "gain": 1.0
+  }
+}
