@@ -34,6 +34,7 @@ echo "Compiling v2 DSP plugin..."
 
 cat src/module.json > dist/yt/module.json
 cat src/ui.js > dist/yt/ui.js
+cat src/ui_chain.js > dist/yt/ui_chain.js
 cat build/module/dsp.so > dist/yt/dsp.so
 chmod +x dist/yt/dsp.so
 
