@@ -7,10 +7,12 @@ import {
 } from '/data/UserData/move-anything/shared/text_entry.mjs';
 
 import {
-  MoveShift
+  MoveShift,
+  MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob7, MoveKnob8,
+  MoveKnob1Touch, MoveKnob2Touch, MoveKnob3Touch, MoveKnob7Touch, MoveKnob8Touch
 } from '/data/UserData/move-anything/shared/constants.mjs';
 
-import { isCapacitiveTouchMessage } from '/data/UserData/move-anything/shared/input_filter.mjs';
+import { isCapacitiveTouchMessage, decodeDelta } from '/data/UserData/move-anything/shared/input_filter.mjs';
 
 import { createAction } from '/data/UserData/move-anything/shared/menu_items.mjs';
 import { createMenuState, handleMenuInput } from '/data/UserData/move-anything/shared/menu_nav.mjs';
@@ -18,6 +20,7 @@ import { createMenuStack } from '/data/UserData/move-anything/shared/menu_stack.
 import { drawStackMenu } from '/data/UserData/move-anything/shared/menu_render.mjs';
 
 const MAX_MENU_RESULTS = 20;
+const SPINNER = ['-', '/', '|', '\\'];
 
 let searchQuery = '';
 let searchStatus = 'idle';
@@ -32,7 +35,10 @@ let menuState = createMenuState();
 let menuStack = createMenuStack();
 
 let tickCounter = 0;
+let spinnerTick = 0;
+let spinnerFrame = 0;
 let needsRedraw = true;
+let pendingKnobAction = null;
 
 function cleanLabel(text, maxLen = 24) {
   let s = String(text || '');
@@ -40,6 +46,47 @@ function cleanLabel(text, maxLen = 24) {
   if (!s) s = '(untitled)';
   if (s.length > maxLen) s = `${s.slice(0, Math.max(0, maxLen - 1))}…`;
   return s;
+}
+
+function currentActivityLabel() {
+  if (searchStatus === 'searching') return 'Searching';
+  if (streamStatus === 'loading') return 'Loading';
+  if (streamStatus === 'buffering') return 'Buffering';
+  if (streamStatus === 'seeking') return 'Seeking';
+  return '';
+}
+
+function setPendingKnobAction(cc, action, prompt) {
+  pendingKnobAction = { cc, action };
+  statusMessage = prompt;
+  needsRedraw = true;
+}
+
+function runKnobAction(action) {
+  if (action === 'play_pause') {
+    host_module_set_param('play_pause_toggle', '1');
+    statusMessage = 'Toggling pause...';
+    return;
+  }
+  if (action === 'rewind_15') {
+    host_module_set_param('seek_delta_seconds', '-15');
+    statusMessage = 'Rewind 15s...';
+    return;
+  }
+  if (action === 'forward_15') {
+    host_module_set_param('seek_delta_seconds', '15');
+    statusMessage = 'Forward 15s...';
+    return;
+  }
+  if (action === 'stop') {
+    host_module_set_param('stop', '1');
+    statusMessage = 'Stopping...';
+    return;
+  }
+  if (action === 'restart') {
+    host_module_set_param('restart', '1');
+    statusMessage = 'Restarting...';
+  }
 }
 
 function clampSelectedIndex() {
@@ -131,11 +178,13 @@ function refreshState() {
   }
 
   if (prevStreamStatus !== streamStatus) {
-    if (streamStatus === 'streaming') {
-      statusMessage = 'Playing';
-    } else if (streamStatus === 'eof' || streamStatus === 'stopped') {
-      statusMessage = 'Stopped';
-    }
+    if (streamStatus === 'loading') statusMessage = 'Loading stream...';
+    else if (streamStatus === 'buffering') statusMessage = 'Buffering...';
+    else if (streamStatus === 'seeking') statusMessage = 'Seeking...';
+    else if (streamStatus === 'paused') statusMessage = 'Paused';
+    else if (streamStatus === 'streaming') statusMessage = 'Playing';
+    else if (streamStatus === 'eof') statusMessage = 'Ended';
+    else if (streamStatus === 'stopped') statusMessage = 'Stopped';
     needsRedraw = true;
   }
 }
@@ -170,7 +219,8 @@ function openSearchPrompt() {
 
 function currentFooter() {
   if (isTextEntryActive()) return '';
-  if (searchStatus === 'searching') return 'Searching...';
+  const activity = currentActivityLabel();
+  if (activity) return `${activity} ${SPINNER[spinnerFrame]}`;
   if (statusMessage) return statusMessage;
   return 'Click:select Back:exit';
 }
@@ -188,7 +238,10 @@ globalThis.init = function () {
   menuState = createMenuState();
   menuStack = createMenuStack();
   tickCounter = 0;
+  spinnerTick = 0;
+  spinnerFrame = 0;
   needsRedraw = true;
+  pendingKnobAction = null;
 
   rebuildMenu();
 };
@@ -203,6 +256,16 @@ globalThis.tick = function () {
   tickCounter = (tickCounter + 1) % 6;
   if (tickCounter === 0) {
     refreshState();
+  }
+
+  if (currentActivityLabel()) {
+    spinnerTick = (spinnerTick + 1) % 3;
+    if (spinnerTick === 0) {
+      spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
+      needsRedraw = true;
+    }
+  } else {
+    spinnerTick = 0;
   }
 
   if (needsRedraw) {
@@ -227,9 +290,44 @@ globalThis.onMidiMessageInternal = function (data) {
   const cc = data[1];
   const val = data[2];
 
-  if (isCapacitiveTouchMessage(data)) return;
-
   if (status !== 0xB0) return;
+
+  if (cc === MoveKnob1Touch && val > 0) {
+    setPendingKnobAction(MoveKnob1, 'play_pause', streamStatus === 'paused' ? 'Resume?' : 'Pause?');
+    return;
+  }
+  if (cc === MoveKnob2Touch && val > 0) {
+    setPendingKnobAction(MoveKnob2, 'rewind_15', 'Rewind 15s?');
+    return;
+  }
+  if (cc === MoveKnob3Touch && val > 0) {
+    setPendingKnobAction(MoveKnob3, 'forward_15', 'Forward 15s?');
+    return;
+  }
+  if (cc === MoveKnob7Touch && val > 0) {
+    setPendingKnobAction(MoveKnob7, 'stop', 'Stop stream?');
+    return;
+  }
+  if (cc === MoveKnob8Touch && val > 0) {
+    setPendingKnobAction(MoveKnob8, 'restart', 'Start over?');
+    return;
+  }
+
+  if (cc === MoveKnob1 || cc === MoveKnob2 || cc === MoveKnob3 || cc === MoveKnob7 || cc === MoveKnob8) {
+    const delta = decodeDelta(val);
+    if (delta > 0 && pendingKnobAction && pendingKnobAction.cc === cc) {
+      runKnobAction(pendingKnobAction.action);
+      pendingKnobAction = null;
+      needsRedraw = true;
+    } else if (delta < 0 && pendingKnobAction && pendingKnobAction.cc === cc) {
+      pendingKnobAction = null;
+      statusMessage = 'Cancelled';
+      needsRedraw = true;
+    }
+    return;
+  }
+
+  if (isCapacitiveTouchMessage(data)) return;
 
   if (cc === MoveShift) {
     shiftHeld = val > 0;

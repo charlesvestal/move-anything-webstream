@@ -12,7 +12,8 @@
 
 #include "plugin_api_v1.h"
 
-#define RING_SAMPLES (MOVE_SAMPLE_RATE * 2 * 2) /* 2s stereo */
+#define RING_SECONDS 12
+#define RING_SAMPLES (MOVE_SAMPLE_RATE * 2 * RING_SECONDS) /* stereo ring */
 #define RESTART_RETRY_BLOCKS 64                 /* ~186ms at 128f blocks */
 
 #define SEARCH_MAX_RESULTS 20
@@ -45,8 +46,14 @@ typedef struct {
     size_t read_pos;
     size_t write_pos;
     size_t count;
-    bool has_pending_byte;
-    uint8_t pending_byte;
+    uint64_t dropped_samples;
+    uint64_t dropped_log_next;
+    uint8_t pending_bytes[4];
+    uint8_t pending_len;
+    size_t prime_needed_samples;
+    bool paused;
+    size_t played_samples;
+    size_t seek_discard_samples;
 
     float gain;
 
@@ -155,6 +162,7 @@ static void ring_push(yt_instance_t *inst, const int16_t *samples, size_t n) {
         if (inst->count == RING_SAMPLES) {
             inst->read_pos = (inst->read_pos + 1) % RING_SAMPLES;
             inst->count--;
+            inst->dropped_samples++;
         }
         inst->ring[inst->write_pos] = samples[i];
         inst->write_pos = (inst->write_pos + 1) % RING_SAMPLES;
@@ -185,8 +193,23 @@ static void clear_ring(yt_instance_t *inst) {
     inst->read_pos = 0;
     inst->write_pos = 0;
     inst->count = 0;
-    inst->has_pending_byte = false;
-    inst->pending_byte = 0;
+    inst->dropped_samples = 0;
+    inst->dropped_log_next = (uint64_t)MOVE_SAMPLE_RATE * 2ULL;
+    inst->pending_len = 0;
+    memset(inst->pending_bytes, 0, sizeof(inst->pending_bytes));
+    inst->prime_needed_samples = 0;
+}
+
+static void restart_stream_from_beginning(yt_instance_t *inst, size_t discard_samples) {
+    if (!inst) return;
+    stop_stream(inst);
+    clear_ring(inst);
+    clear_error(inst);
+    inst->stream_eof = false;
+    inst->restart_countdown = 0;
+    inst->paused = false;
+    inst->played_samples = 0;
+    inst->seek_discard_samples = discard_samples;
 }
 
 static int start_stream(yt_instance_t *inst) {
@@ -196,12 +219,13 @@ static int start_stream(yt_instance_t *inst) {
 
     snprintf(cmd, sizeof(cmd),
         "/bin/sh -lc '"
-        "U=\"$(\"%s/bin/yt-dlp\" --no-playlist "
+        "exec \"%s/bin/yt-dlp\" --no-playlist "
         "--extractor-args \"youtube:player_skip=js\" "
-        "-f \"ba[protocol^=http][protocol!*=dash]/ba\" -g \"%s\")\" && "
-        "exec \"%s/bin/ffmpeg\" -hide_banner -loglevel error "
-        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 "
-        "-i \"$U\" -vn -sn -dn -af \"aresample=%d\" -f s16le -ac 2 -ar %d pipe:1'",
+        "-f \"bestaudio[ext=m4a]/bestaudio\" -o - \"%s\" 2>/dev/null | "
+        "\"%s/bin/ffmpeg\" -hide_banner -loglevel error "
+        "-i pipe:0 -vn -sn -dn "
+        "-af \"aresample=%d:async=1:min_hard_comp=0.100:first_pts=0\" "
+        "-f s16le -ac 2 -ar %d pipe:1'",
         inst->module_dir, inst->stream_url, inst->module_dir, MOVE_SAMPLE_RATE, MOVE_SAMPLE_RATE);
 
     inst->pipe = popen(cmd, "r");
@@ -228,6 +252,7 @@ static int start_stream(yt_instance_t *inst) {
     clear_error(inst);
     inst->stream_eof = false;
     inst->restart_countdown = 0;
+    inst->prime_needed_samples = (size_t)MOVE_SAMPLE_RATE; /* ~0.5s stereo */
     yt_log("stream pipeline started");
     return 0;
 }
@@ -420,32 +445,40 @@ static int start_search_async(yt_instance_t *inst, const char *query) {
 
 static void pump_pipe(yt_instance_t *inst) {
     uint8_t buf[4096];
-    uint8_t merged[4097];
+    uint8_t merged[4100];
     int16_t samples[2048];
 
     while (inst->pipe && !inst->stream_eof) {
+        if (inst->count + 2048 >= RING_SAMPLES) {
+            break; /* Let pipe backpressure pace producer; avoid dropping */
+        }
+
         ssize_t n = read(inst->pipe_fd, buf, sizeof(buf));
         if (n > 0) {
-            size_t merged_bytes = 0;
+            size_t merged_bytes = inst->pending_len;
+            size_t aligned_bytes;
+            size_t remainder;
             size_t sample_count;
 
-            if (inst->has_pending_byte) {
-                merged[merged_bytes++] = inst->pending_byte;
-                inst->has_pending_byte = false;
+            if (inst->pending_len > 0) {
+                memcpy(merged, inst->pending_bytes, inst->pending_len);
             }
 
             memcpy(merged + merged_bytes, buf, (size_t)n);
             merged_bytes += (size_t)n;
 
-            if ((merged_bytes & 1U) != 0U) {
-                inst->pending_byte = merged[merged_bytes - 1];
-                inst->has_pending_byte = true;
-                merged_bytes--;
+            aligned_bytes = merged_bytes & ~((size_t)3U);
+            remainder = merged_bytes - aligned_bytes;
+            if (remainder > 0) {
+                memcpy(inst->pending_bytes, merged + aligned_bytes, remainder);
             }
+            inst->pending_len = (uint8_t)remainder;
 
-            sample_count = merged_bytes / sizeof(int16_t);
-            memcpy(samples, merged, sample_count * sizeof(int16_t));
-            ring_push(inst, samples, sample_count);
+            sample_count = aligned_bytes / sizeof(int16_t);
+            if (sample_count > 0) {
+                memcpy(samples, merged, sample_count * sizeof(int16_t));
+                ring_push(inst, samples, sample_count);
+            }
             if ((size_t)n < sizeof(buf)) {
                 break;
             }
@@ -526,6 +559,9 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             inst->stream_url[0] = '\0';
             inst->stream_eof = false;
             inst->restart_countdown = 0;
+            inst->paused = false;
+            inst->played_samples = 0;
+            inst->seek_discard_samples = 0;
             stop_stream(inst);
             clear_ring(inst);
             clear_error(inst);
@@ -533,11 +569,52 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         }
 
         snprintf(inst->stream_url, sizeof(inst->stream_url), "%s", val);
+        restart_stream_from_beginning(inst, 0);
+        return;
+    }
+
+    if (strcmp(key, "play_pause_toggle") == 0) {
+        if (inst->stream_url[0] != '\0' && !inst->stream_eof) {
+            inst->paused = !inst->paused;
+        }
+        return;
+    }
+
+    if (strcmp(key, "stop") == 0) {
+        inst->stream_url[0] = '\0';
         inst->stream_eof = false;
         inst->restart_countdown = 0;
+        inst->paused = false;
+        inst->played_samples = 0;
+        inst->seek_discard_samples = 0;
         stop_stream(inst);
         clear_ring(inst);
         clear_error(inst);
+        return;
+    }
+
+    if (strcmp(key, "restart") == 0) {
+        if (inst->stream_url[0] != '\0') {
+            restart_stream_from_beginning(inst, 0);
+        }
+        return;
+    }
+
+    if (strcmp(key, "seek_delta_seconds") == 0) {
+        long delta_sec;
+        long long current_frames;
+        long long target_frames;
+        size_t discard_samples;
+
+        if (inst->stream_url[0] == '\0') return;
+
+        delta_sec = strtol(val, NULL, 10);
+        current_frames = (long long)(inst->played_samples / 2);
+        target_frames = current_frames + (long long)delta_sec * (long long)MOVE_SAMPLE_RATE;
+        if (target_frames < 0) target_frames = 0;
+
+        discard_samples = (size_t)target_frames * 2;
+        restart_stream_from_beginning(inst, discard_samples);
         return;
     }
 
@@ -575,9 +652,15 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     }
     if (strcmp(key, "stream_status") == 0) {
         if (!inst) return snprintf(buf, (size_t)buf_len, "stopped");
-        if (!inst->pipe && inst->restart_countdown > 0) return snprintf(buf, (size_t)buf_len, "restarting");
-        if (!inst->pipe) return snprintf(buf, (size_t)buf_len, "stopped");
+        if (inst->stream_url[0] == '\0') return snprintf(buf, (size_t)buf_len, "stopped");
+        if (inst->paused) return snprintf(buf, (size_t)buf_len, "paused");
+        if (inst->seek_discard_samples > 0) return snprintf(buf, (size_t)buf_len, "seeking");
+        if (!inst->pipe && inst->restart_countdown > 0) return snprintf(buf, (size_t)buf_len, "loading");
+        if (!inst->pipe && !inst->stream_eof) return snprintf(buf, (size_t)buf_len, "loading");
         if (inst->stream_eof) return snprintf(buf, (size_t)buf_len, "eof");
+        if (inst->prime_needed_samples > 0 && inst->count < inst->prime_needed_samples) {
+            return snprintf(buf, (size_t)buf_len, "buffering");
+        }
         return snprintf(buf, (size_t)buf_len, "streaming");
     }
 
@@ -683,9 +766,11 @@ static int v2_get_error(void *instance, char *buf, int buf_len) {
 
 static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int frames) {
     yt_instance_t *inst = (yt_instance_t *)instance;
+    int16_t discard_buf[1024];
     size_t needed;
     size_t got;
     size_t i;
+    char log_msg[128];
 
     if (!out_interleaved_lr || frames <= 0) return;
 
@@ -702,6 +787,10 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         return;
     }
 
+    if (inst->paused) {
+        return;
+    }
+
     if (!inst->pipe) {
         if (inst->restart_countdown > 0) {
             inst->restart_countdown--;
@@ -712,7 +801,43 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     }
 
     pump_pipe(inst);
+
+    if (inst->prime_needed_samples > 0) {
+        if (inst->count < inst->prime_needed_samples && !inst->stream_eof) {
+            return;
+        }
+        inst->prime_needed_samples = 0;
+    }
+
+    while (inst->seek_discard_samples > 0) {
+        size_t chunk = inst->seek_discard_samples;
+        size_t discarded;
+        if (chunk > (sizeof(discard_buf) / sizeof(discard_buf[0]))) {
+            chunk = sizeof(discard_buf) / sizeof(discard_buf[0]);
+        }
+
+        discarded = ring_pop(inst, discard_buf, chunk);
+        if (discarded == 0) {
+            pump_pipe(inst);
+            if (inst->count == 0) break;
+            continue;
+        }
+
+        inst->seek_discard_samples -= discarded;
+        inst->played_samples += discarded;
+    }
+
     got = ring_pop(inst, out_interleaved_lr, needed);
+    inst->played_samples += got;
+
+    if (inst->dropped_samples >= inst->dropped_log_next) {
+        snprintf(log_msg,
+                 sizeof(log_msg),
+                 "ring overflow dropped_samples=%llu",
+                 (unsigned long long)inst->dropped_samples);
+        yt_log(log_msg);
+        inst->dropped_log_next += (uint64_t)MOVE_SAMPLE_RATE * 2ULL;
+    }
 
     if (inst->gain != 1.0f) {
         for (i = 0; i < got; i++) {
