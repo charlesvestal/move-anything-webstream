@@ -2,7 +2,7 @@
   "id": "webstream",
   "name": "Webstream",
   "abbrev": "WS",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Web audio search and streaming generator with provider backends",
   "author": "charlesvestal",
   "license": "MIT",
