@@ -29,8 +29,21 @@ const SEARCH_HISTORY_PATH = '/data/UserData/move-anything/config/webstream_searc
 const LEGACY_SEARCH_HISTORY_PATH = '/data/UserData/move-anything/webstream_search_history.json';
 const LEGACY_SEARCH_HISTORY_PATH_2 = '/data/UserData/move-anything/yt_search_history.json';
 const SPINNER = ['-', '/', '|', '\\'];
+const PROVIDERS = [
+  { id: 'youtube', label: 'YouTube' },
+  { id: 'freesound', label: 'FreeSound' },
+  { id: 'archive', label: 'Archive.org' },
+  { id: 'soundcloud', label: 'SoundCloud' }
+];
+const PROVIDER_TAGS = {
+  youtube: '[YT]',
+  freesound: '[FS]',
+  archive: '[AR]',
+  soundcloud: '[SC]'
+};
 
 let searchQuery = '';
+let searchProvider = 'youtube';
 let searchStatus = 'idle';
 let searchCount = 0;
 let streamStatus = 'stopped';
@@ -48,6 +61,34 @@ let spinnerTick = 0;
 let spinnerFrame = 0;
 let needsRedraw = true;
 let pendingKnobAction = null;
+
+function normalizeProvider(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return 'youtube';
+  if (raw === 'yt') return 'youtube';
+  if (raw === 'fs') return 'freesound';
+  if (raw === 'ia' || raw === 'archiveorg' || raw === 'internetarchive') return 'archive';
+  if (raw === 'sc') return 'soundcloud';
+  return raw;
+}
+
+function providerLabel(providerId) {
+  const id = normalizeProvider(providerId);
+  const found = PROVIDERS.find((p) => p.id === id);
+  return found ? found.label : id;
+}
+
+function providerTag(providerId) {
+  const id = normalizeProvider(providerId);
+  return PROVIDER_TAGS[id] || '[??]';
+}
+
+function historyEntry(providerId, query) {
+  return {
+    provider: normalizeProvider(providerId),
+    query: String(query || '').trim()
+  };
+}
 
 function cleanLabel(text, maxLen = 24) {
   let s = String(text || '');
@@ -111,11 +152,11 @@ function clampSelectedIndex() {
   }
 }
 
-function addSearchToHistory(query) {
-  const q = String(query || '').trim();
-  if (!q) return;
-  searchHistory = searchHistory.filter((item) => item !== q);
-  searchHistory.unshift(q);
+function addSearchToHistory(providerId, query) {
+  const entry = historyEntry(providerId, query);
+  if (!entry.query) return;
+  searchHistory = searchHistory.filter((item) => !(item.provider === entry.provider && item.query === entry.query));
+  searchHistory.unshift(entry);
   if (searchHistory.length > MAX_SEARCH_HISTORY) {
     searchHistory = searchHistory.slice(0, MAX_SEARCH_HISTORY);
   }
@@ -164,10 +205,15 @@ function loadSearchHistoryFromDisk() {
 
     const next = [];
     for (const entry of parsed) {
-      const q = String(entry || '').trim();
-      if (!q) continue;
-      if (next.includes(q)) continue;
-      next.push(q);
+      let item = null;
+      if (typeof entry === 'string') {
+        item = historyEntry('youtube', entry);
+      } else if (entry && typeof entry === 'object') {
+        item = historyEntry(entry.provider, entry.query);
+      }
+      if (!item || !item.query) continue;
+      if (next.some((x) => x.provider === item.provider && x.query === item.query)) continue;
+      next.push(item);
       if (next.length >= MAX_SEARCH_HISTORY) break;
     }
     searchHistory = next;
@@ -200,20 +246,35 @@ function saveSearchHistoryToDisk() {
   writeTextFile(SEARCH_HISTORY_PATH, payload);
 }
 
-function submitSearch(query) {
+function submitSearch(providerId, query) {
+  const provider = normalizeProvider(providerId);
   const q = String(query || '').trim();
   if (!q) return;
 
-  addSearchToHistory(q);
+  searchProvider = provider;
+  addSearchToHistory(provider, q);
   saveSearchHistoryToDisk();
   results = [];
   searchCount = 0;
   selectedIndex = 0;
   menuState.selectedIndex = 0;
-  statusMessage = 'Searching...';
+  statusMessage = `Searching ${providerTag(provider)}...`;
   rebuildMenu();
 
+  host_module_set_param('search_provider', provider);
   host_module_set_param('search_query', q);
+}
+
+function clearSearchState() {
+  searchQuery = '';
+  searchStatus = 'idle';
+  searchCount = 0;
+  results = [];
+  selectedIndex = 0;
+  menuState.selectedIndex = 0;
+  host_module_set_param('search_query', '');
+  statusMessage = 'New search';
+  rebuildMenu();
 }
 
 function openSearchHistoryMenu() {
@@ -223,15 +284,21 @@ function openSearchHistoryMenu() {
   if (searchHistory.length === 0) {
     items.push(createAction('(No previous searches)', () => {}));
   } else {
-    for (const query of searchHistory) {
-      const label = cleanLabel(query, 24);
+    for (const entry of searchHistory) {
+      const query = String(entry?.query || '').trim();
+      const provider = normalizeProvider(entry?.provider);
+      if (!query) continue;
+      const label = cleanLabel(`${providerTag(provider)} ${query}`, 24);
       items.push(createAction(label, () => {
         while (menuStack.depth() > 1) {
           menuStack.pop();
         }
         menuState.selectedIndex = 0;
-        submitSearch(query);
+        submitSearch(provider, query);
       }));
+    }
+    if (items.length === 0) {
+      items.push(createAction('(No previous searches)', () => {}));
     }
   }
 
@@ -244,10 +311,29 @@ function openSearchHistoryMenu() {
   needsRedraw = true;
 }
 
+function openProviderMenu() {
+  const items = PROVIDERS.map((provider) => createAction(provider.label, () => {
+    while (menuStack.depth() > 1) {
+      menuStack.pop();
+    }
+    menuState.selectedIndex = 0;
+    openSearchPrompt(provider.id);
+  }));
+
+  menuStack.push({
+    title: 'Provider',
+    items,
+    selectedIndex: 0
+  });
+  menuState.selectedIndex = 0;
+  needsRedraw = true;
+}
+
 function buildRootItems() {
   const items = [
     createAction('[New Search...]', () => {
-      openSearchPrompt();
+      clearSearchState();
+      openProviderMenu();
     }),
     createAction('[Previous searches]', () => {
       openSearchHistoryMenu();
@@ -257,12 +343,14 @@ function buildRootItems() {
   const count = Math.min(results.length, MAX_MENU_RESULTS);
   for (let i = 0; i < count; i++) {
     const row = results[i];
+    const rowProvider = normalizeProvider(row?.provider || searchProvider);
     const title = cleanLabel(row?.title || `Result ${i + 1}`);
     items.push(
       createAction(title, () => {
         if (!row || !row.url) return;
+        host_module_set_param('stream_provider', rowProvider);
         host_module_set_param('stream_url', row.url);
-        statusMessage = 'Loading stream...';
+        statusMessage = `Loading ${providerTag(rowProvider)} stream...`;
         needsRedraw = true;
       })
     );
@@ -276,12 +364,13 @@ function rebuildMenu() {
   const current = menuStack.current();
   if (!current) {
     menuStack.push({
-      title: 'YT Search',
+      title: `Webstream ${providerTag(searchProvider)}`,
       items,
       selectedIndex: 0
     });
     menuState.selectedIndex = 0;
   } else {
+    current.title = `Webstream ${providerTag(searchProvider)}`;
     current.items = items;
     clampSelectedIndex();
   }
@@ -291,29 +380,32 @@ function rebuildMenu() {
 function loadResults() {
   const out = [];
   for (let i = 0; i < searchCount && i < MAX_MENU_RESULTS; i++) {
+    const provider = normalizeProvider(host_module_get_param(`search_result_provider_${i}`) || searchProvider);
     const title = host_module_get_param(`search_result_title_${i}`) || '';
     const url = host_module_get_param(`search_result_url_${i}`) || '';
-    out.push({ title, url });
+    out.push({ provider, title, url });
   }
   results = out;
 }
 
 function refreshState() {
+  const prevSearchProvider = searchProvider;
   const prevSearchStatus = searchStatus;
   const prevSearchCount = searchCount;
   const prevStreamStatus = streamStatus;
 
   streamStatus = host_module_get_param('stream_status') || 'stopped';
+  searchProvider = normalizeProvider(host_module_get_param('search_provider') || searchProvider);
   searchQuery = host_module_get_param('search_query') || '';
   searchStatus = host_module_get_param('search_status') || 'idle';
   searchCount = parseInt(host_module_get_param('search_count') || '0', 10) || 0;
 
-  if (prevSearchStatus !== searchStatus || prevSearchCount !== searchCount) {
+  if (prevSearchProvider !== searchProvider || prevSearchStatus !== searchStatus || prevSearchCount !== searchCount) {
     loadResults();
     rebuildMenu();
 
     if (searchStatus === 'searching') {
-      statusMessage = 'Searching...';
+      statusMessage = `Searching ${providerTag(searchProvider)}...`;
     } else if (searchStatus === 'queued') {
       statusMessage = 'Search queued...';
     } else if (searchStatus === 'done') {
@@ -339,10 +431,12 @@ function refreshState() {
   }
 }
 
-function openSearchPrompt() {
+function openSearchPrompt(providerId = searchProvider) {
+  const provider = normalizeProvider(providerId);
+  searchProvider = provider;
   openTextEntry({
-    title: 'Search YouTube',
-    initialText: searchQuery,
+    title: `Search ${providerTag(provider)}`,
+    initialText: '',
     onConfirm: (text) => {
       const query = (text || '').trim();
       if (!query) {
@@ -350,7 +444,7 @@ function openSearchPrompt() {
         needsRedraw = true;
         return;
       }
-      submitSearch(query);
+      submitSearch(provider, query);
     },
     onCancel: () => {
       statusMessage = 'Search cancelled';
@@ -369,6 +463,7 @@ function currentFooter() {
 
 globalThis.init = function () {
   searchQuery = '';
+  searchProvider = normalizeProvider(host_module_get_param('search_provider') || 'youtube');
   searchStatus = 'idle';
   searchCount = 0;
   streamStatus = 'stopped';
@@ -386,6 +481,7 @@ globalThis.init = function () {
   needsRedraw = true;
   pendingKnobAction = null;
 
+  host_module_set_param('search_query', '');
   rebuildMenu();
 };
 

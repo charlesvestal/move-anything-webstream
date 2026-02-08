@@ -174,4 +174,10 @@ file dist/webstream/dsp.so
 - The plugin is search-driven (it does not auto-start a hardcoded URL on load).
 - Runtime network and YouTube behavior can affect startup latency.
 - `yt-dlp`/site extraction behavior may change over time; rebuild dependencies as needed.
+- Provider support is mixed:
+  - `youtube` + `soundcloud` use `yt-dlp`.
+  - `archive` uses archive.org public APIs.
+  - `freesound` uses FreeSound API and requires a token (`FREESOUND_API_KEY`/`FREESOUND_TOKEN` env var or `webstream_providers.json`).
+- Optional provider config file on Move:
+  - `/data/UserData/move-anything/config/webstream_providers.json`
 - For distribution terms and dependency licenses, see `THIRD_PARTY_NOTICES.md`.

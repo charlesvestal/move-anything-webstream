@@ -1,6 +1,6 @@
 # Webstream Module (Move Anything)
 
-Experimental v2 sound-generator module for web audio playback via provider backends (YouTube via `yt-dlp` first).
+Experimental v2 sound-generator module for web audio playback via provider backends.
 
 Third-party, unsupported community module. Not affiliated with or endorsed by Ableton or YouTube.
 
@@ -8,12 +8,43 @@ Third-party, unsupported community module. Not affiliated with or endorsed by Ab
 
 - Exports a **v2 DSP plugin** (`move_plugin_init_v2`)
 - Uses menu UI with:
-  - `[New Search...]`
+  - `[New Search...]` (provider picker first)
   - `[Previous searches]`
   - search results list
 - Starts streaming when a result is selected
 - Uses a warm `yt-dlp` daemon for search/URL resolve, then `ffmpeg` decode to 44.1kHz stereo `s16le`
 - Supports transport controls (play/pause, seek ±15s, stop, restart) via mapped knobs
+- Current providers:
+  - `youtube` (via `yt-dlp`)
+  - `soundcloud` (via `yt-dlp`)
+  - `archive` (via archive.org APIs)
+  - `freesound` (via FreeSound API; requires token)
+
+## Provider Configuration
+
+Runtime provider config path:
+
+- `/data/UserData/move-anything/config/webstream_providers.json`
+
+Example:
+
+```json
+{
+  "providers": {
+    "freesound": {
+      "enabled": true,
+      "api_key": "YOUR_FREESOUND_TOKEN"
+    },
+    "archive": { "enabled": true },
+    "youtube": { "enabled": true },
+    "soundcloud": { "enabled": true }
+  }
+}
+```
+
+FreeSound token can also be supplied via env var:
+
+- `FREESOUND_API_KEY` (or `FREESOUND_TOKEN`)
 
 ## Build
 
