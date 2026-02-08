@@ -152,7 +152,7 @@ def create_ytdlp_resolve_opts(provider: str) -> dict:
     if provider == "youtube":
         opts["extractor_args"] = {"youtube": {"player_skip": ["js"]}}
     if provider == "soundcloud":
-        opts["format"] = "bestaudio"
+        opts["format"] = "http_mp3_1_0/hls_mp3_1_0/bestaudio"
     return opts
 
 

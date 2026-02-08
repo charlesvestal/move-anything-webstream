@@ -28,21 +28,30 @@
 #define SEARCH_QUERY_MAX 256
 #define SEARCH_ID_MAX 32
 #define SEARCH_TEXT_MAX 192
-#define SEARCH_URL_MAX 160
+#define SEARCH_URL_MAX 512
+#define PROVIDER_MAX 24
 #define STREAM_URL_MAX 4096
 #define HTTP_HEADER_MAX 384
 #define DAEMON_LINE_MAX 4096
 #define DAEMON_START_TIMEOUT_MS 12000
 #define DAEMON_SEARCH_TIMEOUT_MS 12000
 #define DAEMON_RESOLVE_TIMEOUT_MS 12000
+#define WS_RUNTIME_LOG_PATH "/data/UserData/move-anything/cache/webstream-runtime.log"
 
 static const host_api_v1_t *g_host = NULL;
 
 static void* search_thread_main(void *arg);
 static void* resolve_thread_main(void *arg);
 static void* warmup_thread_main(void *arg);
+static void* stream_reap_thread_main(void *arg);
 
 typedef struct {
+    FILE *pipe;
+    pid_t pid;
+} stream_reap_job_t;
+
+typedef struct {
+    char provider[PROVIDER_MAX];
     char id[SEARCH_ID_MAX];
     char title[SEARCH_TEXT_MAX];
     char channel[SEARCH_TEXT_MAX];
@@ -52,11 +61,13 @@ typedef struct {
 
 typedef struct {
     char module_dir[512];
+    char stream_provider[PROVIDER_MAX];
     char stream_url[STREAM_URL_MAX];
     char error_msg[256];
 
     FILE *pipe;
     int pipe_fd;
+    pid_t stream_pid;
     bool stream_eof;
     int restart_countdown;
     bool active_stream_resolved;
@@ -111,7 +122,9 @@ typedef struct {
     pthread_t search_thread;
     bool search_thread_valid;
     bool search_thread_running;
+    char search_provider[PROVIDER_MAX];
     char search_query[SEARCH_QUERY_MAX];
+    char queued_search_provider[PROVIDER_MAX];
     char queued_search_query[SEARCH_QUERY_MAX];
     bool queued_search_pending;
     char search_status[24];
@@ -121,7 +134,17 @@ typedef struct {
     search_result_t search_results[SEARCH_MAX_RESULTS];
 } yt_instance_t;
 
+static void append_ws_log(const char *msg) {
+    FILE *fp;
+    if (!msg || msg[0] == '\0') return;
+    fp = fopen(WS_RUNTIME_LOG_PATH, "a");
+    if (!fp) return;
+    fprintf(fp, "%s\n", msg);
+    fclose(fp);
+}
+
 static void yt_log(const char *msg) {
+    append_ws_log(msg);
     if (g_host && g_host->log) {
         char buf[384];
         snprintf(buf, sizeof(buf), "[ws] %s", msg);
@@ -328,6 +351,7 @@ static void start_warmup_if_needed(yt_instance_t *inst) {
 static void set_error(yt_instance_t *inst, const char *msg) {
     if (!inst) return;
     snprintf(inst->error_msg, sizeof(inst->error_msg), "%s", msg ? msg : "unknown error");
+    append_ws_log(inst->error_msg);
     yt_log(inst->error_msg);
 }
 
@@ -340,6 +364,54 @@ static void set_search_status(yt_instance_t *inst, const char *status, const cha
     if (!inst) return;
     snprintf(inst->search_status, sizeof(inst->search_status), "%s", status ? status : "idle");
     snprintf(inst->search_error, sizeof(inst->search_error), "%s", err ? err : "");
+}
+
+static void normalize_provider_value(const char *in, char *out, size_t out_len) {
+    char input_copy[PROVIDER_MAX];
+    const char *src;
+    char tmp[PROVIDER_MAX];
+    size_t i;
+    size_t j = 0;
+
+    if (!out || out_len == 0) return;
+
+    input_copy[0] = '\0';
+    if (in) {
+        snprintf(input_copy, sizeof(input_copy), "%s", in);
+    }
+    src = input_copy;
+    out[0] = '\0';
+
+    for (i = 0; src[i] != '\0' && j + 1 < sizeof(tmp); i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (isalnum(c) || c == '_' || c == '-') {
+            tmp[j++] = (char)tolower(c);
+        }
+    }
+    tmp[j] = '\0';
+
+    if (strcmp(tmp, "yt") == 0 || strcmp(tmp, "youtube") == 0) {
+        snprintf(out, out_len, "youtube");
+        return;
+    }
+    if (strcmp(tmp, "fs") == 0 || strcmp(tmp, "freesound") == 0) {
+        snprintf(out, out_len, "freesound");
+        return;
+    }
+    if (strcmp(tmp, "ia") == 0 || strcmp(tmp, "archive") == 0 ||
+        strcmp(tmp, "archiveorg") == 0 || strcmp(tmp, "internetarchive") == 0) {
+        snprintf(out, out_len, "archive");
+        return;
+    }
+    if (strcmp(tmp, "sc") == 0 || strcmp(tmp, "soundcloud") == 0) {
+        snprintf(out, out_len, "soundcloud");
+        return;
+    }
+    if (tmp[0] == '\0') {
+        snprintf(out, out_len, "youtube");
+        return;
+    }
+    snprintf(out, out_len, "%s", tmp);
 }
 
 static void sanitize_query(const char *in, char *out, size_t out_len) {
@@ -405,30 +477,7 @@ static bool is_allowed_stream_url_char(unsigned char c) {
            c == ',';
 }
 
-static bool host_is_supported(const char *host) {
-    size_t len;
-    if (!host || host[0] == '\0') return false;
-    if (strcmp(host, "youtube.com") == 0 ||
-        strcmp(host, "www.youtube.com") == 0 ||
-        strcmp(host, "m.youtube.com") == 0 ||
-        strcmp(host, "music.youtube.com") == 0 ||
-        strcmp(host, "youtu.be") == 0 ||
-        strcmp(host, "www.youtu.be") == 0) {
-        return true;
-    }
-    len = strlen(host);
-    if (len > 12 && strcmp(host + len - 12, ".youtube.com") == 0) {
-        return true;
-    }
-    return false;
-}
-
 static bool sanitize_stream_url(const char *in, char *out, size_t out_len) {
-    const char *p;
-    const char *host_start;
-    const char *host_end;
-    size_t host_len;
-    char host[128];
     size_t i;
     size_t j = 0;
 
@@ -436,27 +485,6 @@ static bool sanitize_stream_url(const char *in, char *out, size_t out_len) {
     if (!(strncmp(in, "https://", 8) == 0 || strncmp(in, "http://", 7) == 0)) {
         return false;
     }
-
-    p = strstr(in, "://");
-    if (!p) return false;
-    host_start = p + 3;
-    host_end = host_start;
-    while (*host_end && *host_end != '/' && *host_end != '?' && *host_end != '#') {
-        host_end++;
-    }
-    host_len = (size_t)(host_end - host_start);
-    if (host_len == 0 || host_len >= sizeof(host)) return false;
-    memcpy(host, host_start, host_len);
-    host[host_len] = '\0';
-
-    for (i = 0; host[i] != '\0'; i++) {
-        if (host[i] == ':') {
-            host[i] = '\0'; /* strip optional :port */
-            break;
-        }
-    }
-
-    if (!host_is_supported(host)) return false;
 
     for (i = 0; in[i] != '\0'; i++) {
         unsigned char c = (unsigned char)in[i];
@@ -500,6 +528,32 @@ static void sanitize_header_text(const char *in, char *out, size_t out_len) {
         out[j++] = (char)c;
     }
     out[j] = '\0';
+}
+
+static void infer_provider_from_url(const char *url, char *out, size_t out_len) {
+    char normalized[PROVIDER_MAX];
+    const char *u = url ? url : "";
+    if (!out || out_len == 0) return;
+
+    if (strstr(u, "soundcloud.com") || strstr(u, "sndcdn.com")) {
+        snprintf(out, out_len, "soundcloud");
+        return;
+    }
+    if (strstr(u, "freesound.org") || strstr(u, "cdn.freesound.org")) {
+        snprintf(out, out_len, "freesound");
+        return;
+    }
+    if (strstr(u, "archive.org")) {
+        snprintf(out, out_len, "archive");
+        return;
+    }
+    if (strstr(u, "youtube.com") || strstr(u, "youtu.be") || strstr(u, "googlevideo.com")) {
+        snprintf(out, out_len, "youtube");
+        return;
+    }
+
+    normalize_provider_value(out, normalized, sizeof(normalized));
+    snprintf(out, out_len, "%s", normalized);
 }
 
 static uint64_t ring_oldest_abs(const yt_instance_t *inst) {
@@ -557,11 +611,93 @@ static size_t ring_pop(yt_instance_t *inst, int16_t *out, size_t n) {
     return got;
 }
 
+static bool supports_legacy_fallback(const yt_instance_t *inst) {
+    char provider[PROVIDER_MAX];
+    if (!inst) return false;
+    normalize_provider_value(inst->stream_provider, provider, sizeof(provider));
+    return strcmp(provider, "youtube") == 0 || strcmp(provider, "soundcloud") == 0;
+}
+
+static bool prefer_legacy_pipeline(const yt_instance_t *inst) {
+    char provider[PROVIDER_MAX];
+    if (!inst) return false;
+    normalize_provider_value(inst->stream_provider, provider, sizeof(provider));
+    return strcmp(provider, "soundcloud") == 0;
+}
+
+static void terminate_stream_process(pid_t pid) {
+    int status;
+    pid_t rc;
+
+    if (pid <= 0) return;
+
+    rc = waitpid(pid, &status, WNOHANG);
+    if (rc == pid) return;
+
+    (void)kill(-pid, SIGTERM);
+    usleep(120000);
+    rc = waitpid(pid, &status, WNOHANG);
+    if (rc == 0) {
+        (void)kill(-pid, SIGKILL);
+        (void)waitpid(pid, &status, 0);
+    }
+}
+
+static void* stream_reap_thread_main(void *arg) {
+    stream_reap_job_t *job = (stream_reap_job_t *)arg;
+    FILE *pipe = NULL;
+    pid_t pid = -1;
+
+    if (job) {
+        pipe = job->pipe;
+        pid = job->pid;
+        free(job);
+    }
+
+    if (pipe) {
+        fclose(pipe);
+    }
+
+    terminate_stream_process(pid);
+    return NULL;
+}
+
+static void schedule_stream_reap(FILE *pipe, pid_t pid) {
+    stream_reap_job_t *job;
+    pthread_t thread;
+
+    if (!pipe && pid <= 0) return;
+
+    job = calloc(1, sizeof(*job));
+    if (!job) {
+        if (pipe) fclose(pipe);
+        terminate_stream_process(pid);
+        return;
+    }
+
+    job->pipe = pipe;
+    job->pid = pid;
+
+    if (pthread_create(&thread, NULL, stream_reap_thread_main, job) == 0) {
+        pthread_detach(thread);
+        return;
+    }
+
+    if (pipe) fclose(pipe);
+    terminate_stream_process(pid);
+    free(job);
+}
+
 static void stop_stream(yt_instance_t *inst) {
+    FILE *pipe;
+    pid_t pid;
     if (!inst || !inst->pipe) return;
-    pclose(inst->pipe); /* reap child process if it exited */
+    pipe = inst->pipe;
+    pid = inst->stream_pid;
     inst->pipe = NULL;
     inst->pipe_fd = -1;
+    inst->stream_pid = -1;
+    schedule_stream_reap(pipe, pid);
 }
 
 static void clear_ring(yt_instance_t *inst) {
@@ -636,40 +772,97 @@ static void stop_everything(yt_instance_t *inst) {
     pthread_mutex_unlock(&inst->resolve_mutex);
 }
 
-static int start_stream_legacy(yt_instance_t *inst) {
-    char cmd[8192];
+static int spawn_stream_command(yt_instance_t *inst, const char *cmd, const char *err_prefix) {
+    int pipefd[2];
+    pid_t pid;
+    FILE *fp;
 
-    stop_stream(inst);
+    if (!inst || !cmd || cmd[0] == '\0') return -1;
 
-    snprintf(cmd, sizeof(cmd),
-        "/bin/sh -lc '"
-        "exec \"%s/bin/yt-dlp\" --no-playlist "
-        "--extractor-args \"youtube:player_skip=js\" "
-        "-f \"bestaudio[ext=m4a]/bestaudio\" -o - \"%s\" 2>/dev/null | "
-        "\"%s/bin/ffmpeg\" -hide_banner -loglevel error "
-        "-i pipe:0 -vn -sn -dn "
-        "-af \"aresample=%d:async=1:min_hard_comp=0.100:first_pts=0\" "
-        "-f s16le -ac 2 -ar %d pipe:1'",
-        inst->module_dir, inst->stream_url, inst->module_dir, MOVE_SAMPLE_RATE, MOVE_SAMPLE_RATE);
-
-    inst->pipe = popen(cmd, "r");
-    if (!inst->pipe) {
-        set_error(inst, "failed to launch yt-dlp/ffmpeg pipeline");
+    if (pipe(pipefd) != 0) {
+        set_error(inst, err_prefix ? err_prefix : "stream pipe failed");
         return -1;
     }
 
-    inst->pipe_fd = fileno(inst->pipe);
+    pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        set_error(inst, err_prefix ? err_prefix : "stream fork failed");
+        return -1;
+    }
+
+    if (pid == 0) {
+        (void)setpgid(0, 0);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        execl("/bin/sh", "sh", "-lc", cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    fp = fdopen(pipefd[0], "r");
+    if (!fp) {
+        close(pipefd[0]);
+        terminate_stream_process(pid);
+        set_error(inst, err_prefix ? err_prefix : "stream fdopen failed");
+        return -1;
+    }
+
+    inst->pipe = fp;
+    inst->pipe_fd = fileno(fp);
+    inst->stream_pid = pid;
     if (inst->pipe_fd < 0) {
-        set_error(inst, "failed to get pipeline fd");
-        pclose(inst->pipe);
+        FILE *cleanup_pipe = inst->pipe;
+        pid_t cleanup_pid = inst->stream_pid;
         inst->pipe = NULL;
+        inst->pipe_fd = -1;
+        inst->stream_pid = -1;
+        schedule_stream_reap(cleanup_pipe, cleanup_pid);
+        set_error(inst, err_prefix ? err_prefix : "stream fileno failed");
         return -1;
     }
 
     if (fcntl(inst->pipe_fd, F_SETFL, fcntl(inst->pipe_fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
-        set_error(inst, "failed to set non-blocking mode");
-        pclose(inst->pipe);
+        FILE *cleanup_pipe = inst->pipe;
+        pid_t cleanup_pid = inst->stream_pid;
         inst->pipe = NULL;
+        inst->pipe_fd = -1;
+        inst->stream_pid = -1;
+        schedule_stream_reap(cleanup_pipe, cleanup_pid);
+        set_error(inst, err_prefix ? err_prefix : "stream non-blocking failed");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int start_stream_legacy(yt_instance_t *inst) {
+    char cmd[8192];
+    char provider[PROVIDER_MAX];
+    const char *legacy_fmt = "bestaudio[ext=m4a]/bestaudio";
+    const char *extractor_args = "--extractor-args \"youtube:player_skip=js\" ";
+
+    stop_stream(inst);
+    normalize_provider_value(inst->stream_provider, provider, sizeof(provider));
+    if (strcmp(provider, "soundcloud") == 0) {
+        legacy_fmt = "http_mp3_1_0/hls_mp3_1_0/bestaudio";
+        extractor_args = "";
+    }
+
+    snprintf(cmd, sizeof(cmd),
+        "exec \"%s/bin/yt-dlp\" --no-playlist "
+        "%s"
+        "-f \"%s\" -o - \"%s\" 2>/dev/null | "
+        "\"%s/bin/ffmpeg\" -hide_banner -loglevel error "
+        "-i pipe:0 -vn -sn -dn "
+        "-af \"aresample=%d:async=1:min_hard_comp=0.100:first_pts=0\" "
+        "-f s16le -ac 2 -ar %d pipe:1",
+        inst->module_dir, extractor_args, legacy_fmt, inst->stream_url, inst->module_dir, MOVE_SAMPLE_RATE, MOVE_SAMPLE_RATE);
+
+    if (spawn_stream_command(inst, cmd, "failed to launch yt-dlp/ffmpeg pipeline") != 0) {
+        set_error(inst, "failed to launch yt-dlp/ffmpeg pipeline");
         return -1;
     }
 
@@ -700,34 +893,17 @@ static int start_stream_resolved(yt_instance_t *inst, const char *media_url) {
 
     snprintf(cmd,
              sizeof(cmd),
-             "/bin/sh -lc '"
              "exec \"%s/bin/ffmpeg\" -hide_banner -loglevel error "
              "-i \"%s\" -vn -sn -dn "
              "-af \"aresample=%d:async=1:min_hard_comp=0.100:first_pts=0\" "
-             "-f s16le -ac 2 -ar %d pipe:1'",
+             "-f s16le -ac 2 -ar %d pipe:1",
              inst->module_dir,
              clean_url,
              MOVE_SAMPLE_RATE,
              MOVE_SAMPLE_RATE);
 
-    inst->pipe = popen(cmd, "r");
-    if (!inst->pipe) {
+    if (spawn_stream_command(inst, cmd, "failed to launch ffmpeg pipeline") != 0) {
         set_error(inst, "failed to launch ffmpeg pipeline");
-        return -1;
-    }
-
-    inst->pipe_fd = fileno(inst->pipe);
-    if (inst->pipe_fd < 0) {
-        set_error(inst, "failed to get ffmpeg fd");
-        pclose(inst->pipe);
-        inst->pipe = NULL;
-        return -1;
-    }
-
-    if (fcntl(inst->pipe_fd, F_SETFL, fcntl(inst->pipe_fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
-        set_error(inst, "failed to set ffmpeg non-blocking mode");
-        pclose(inst->pipe);
-        inst->pipe = NULL;
         return -1;
     }
 
@@ -775,6 +951,7 @@ static int parse_search_line(const char *line_in, search_result_t *out) {
 
     if (!id || !title) return -1;
 
+    snprintf(out->provider, sizeof(out->provider), "youtube");
     snprintf(out->id, sizeof(out->id), "%s", id);
     snprintf(out->title, sizeof(out->title), "%s", title);
     snprintf(out->channel, sizeof(out->channel), "%s", channel ? channel : "");
@@ -844,26 +1021,29 @@ static int run_search_command_legacy(const yt_instance_t *inst,
 }
 
 static int run_search_command_daemon(yt_instance_t *inst,
+                                     const char *provider,
                                      const char *query,
                                      search_result_t *results,
                                      int *out_count,
                                      char *err,
                                      size_t err_len) {
+    char clean_provider[PROVIDER_MAX];
     char clean_query[SEARCH_QUERY_MAX];
-    char req[SEARCH_QUERY_MAX + 64];
+    char req[SEARCH_QUERY_MAX + PROVIDER_MAX + 64];
     char line[DAEMON_LINE_MAX];
-    char *fields[6];
+    char *fields[8];
     int field_count;
     int count;
     int attempt;
     int timed_out;
     bool retryable_timeout = false;
 
-    if (!inst || !query || !results || !out_count) {
+    if (!inst || !provider || !query || !results || !out_count) {
         if (err && err_len > 0) snprintf(err, err_len, "invalid search args");
         return -1;
     }
 
+    normalize_provider_value(provider, clean_provider, sizeof(clean_provider));
     sanitize_query(query, clean_query, sizeof(clean_query));
 
     pthread_mutex_lock(&inst->daemon_mutex);
@@ -876,7 +1056,7 @@ static int run_search_command_daemon(yt_instance_t *inst,
             return -1;
         }
 
-        snprintf(req, sizeof(req), "SEARCH\t%d\t%s\n", SEARCH_MAX_RESULTS, clean_query);
+        snprintf(req, sizeof(req), "SEARCH\t%s\t%d\t%s\n", clean_provider, SEARCH_MAX_RESULTS, clean_query);
         if (fputs(req, inst->daemon_in) == EOF || fflush(inst->daemon_in) != 0) {
             if (err && err_len > 0) snprintf(err, err_len, "daemon write failed");
             stop_daemon_locked(inst);
@@ -900,17 +1080,29 @@ static int run_search_command_daemon(yt_instance_t *inst,
             }
             if (strcmp(fields[0], "SEARCH_ITEM") == 0) {
                 if (count < SEARCH_MAX_RESULTS && field_count >= 3) {
+                    char fallback_url[SEARCH_URL_MAX];
+                    const char *item_url = "";
+
+                    fallback_url[0] = '\0';
                     snprintf(results[count].id, sizeof(results[count].id), "%s", fields[1]);
                     snprintf(results[count].title, sizeof(results[count].title), "%s", fields[2]);
                     snprintf(results[count].channel, sizeof(results[count].channel), "%s", field_count >= 4 ? fields[3] : "");
                     snprintf(results[count].duration, sizeof(results[count].duration), "%s", field_count >= 5 ? fields[4] : "");
+                    snprintf(results[count].provider, sizeof(results[count].provider), "%s", clean_provider);
                     sanitize_display_text(results[count].title);
                     sanitize_display_text(results[count].channel);
                     sanitize_display_text(results[count].duration);
-                    snprintf(results[count].url,
-                             sizeof(results[count].url),
-                             "https://www.youtube.com/watch?v=%s",
-                             results[count].id);
+
+                    if (field_count >= 6) {
+                        item_url = fields[5];
+                    } else if (strcmp(clean_provider, "youtube") == 0) {
+                        snprintf(fallback_url, sizeof(fallback_url), "https://www.youtube.com/watch?v=%s", results[count].id);
+                        item_url = fallback_url;
+                    }
+
+                    if (!sanitize_stream_url(item_url, results[count].url, sizeof(results[count].url))) {
+                        continue;
+                    }
                     count++;
                 }
                 continue;
@@ -951,18 +1143,22 @@ static int run_search_command_daemon(yt_instance_t *inst,
 }
 
 static int run_search_command(yt_instance_t *inst,
+                              const char *provider,
                               const char *query,
                               search_result_t *results,
                               int *out_count,
                               char *err,
                               size_t err_len) {
-    return run_search_command_daemon(inst, query, results, out_count, err, err_len);
+    return run_search_command_daemon(inst, provider, query, results, out_count, err, err_len);
 }
 
 /* Caller must hold search_mutex. */
-static int spawn_search_thread_locked(yt_instance_t *inst, const char *query) {
-    if (!inst || !query || query[0] == '\0') return -1;
+static int spawn_search_thread_locked(yt_instance_t *inst, const char *provider, const char *query) {
+    char clean_provider[PROVIDER_MAX];
+    if (!inst || !provider || !query || query[0] == '\0') return -1;
 
+    normalize_provider_value(provider, clean_provider, sizeof(clean_provider));
+    snprintf(inst->search_provider, sizeof(inst->search_provider), "%s", clean_provider);
     snprintf(inst->search_query, sizeof(inst->search_query), "%s", query);
     inst->search_count = 0;
     inst->search_elapsed_ms = 0;
@@ -979,9 +1175,23 @@ static int spawn_search_thread_locked(yt_instance_t *inst, const char *query) {
     return 0;
 }
 
+static void clear_search_locked(yt_instance_t *inst) {
+    if (!inst) return;
+    inst->search_query[0] = '\0';
+    inst->queued_search_provider[0] = '\0';
+    inst->queued_search_query[0] = '\0';
+    inst->queued_search_pending = false;
+    inst->search_count = 0;
+    inst->search_elapsed_ms = 0;
+    memset(inst->search_results, 0, sizeof(inst->search_results));
+    set_search_status(inst, "idle", "");
+}
+
 static void* search_thread_main(void *arg) {
     yt_instance_t *inst = (yt_instance_t *)arg;
+    char provider[PROVIDER_MAX];
     char query[SEARCH_QUERY_MAX];
+    char next_provider[PROVIDER_MAX];
     char next_query[SEARCH_QUERY_MAX];
     search_result_t local_results[SEARCH_MAX_RESULTS];
     int local_count = 0;
@@ -995,15 +1205,50 @@ static void* search_thread_main(void *arg) {
     if (!inst) return NULL;
 
     pthread_mutex_lock(&inst->search_mutex);
+    snprintf(provider, sizeof(provider), "%s", inst->search_provider);
     snprintf(query, sizeof(query), "%s", inst->search_query);
     pthread_mutex_unlock(&inst->search_mutex);
 
-    yt_log("search started");
+    snprintf(log_msg, sizeof(log_msg), "search started provider=%s", provider);
+    yt_log(log_msg);
     start_ms = now_ms();
-    rc = run_search_command(inst, query, local_results, &local_count, local_err, sizeof(local_err));
+    rc = run_search_command(inst, provider, query, local_results, &local_count, local_err, sizeof(local_err));
     elapsed_ms = now_ms() - start_ms;
 
     pthread_mutex_lock(&inst->search_mutex);
+
+    if (strcmp(inst->search_query, query) != 0 || strcmp(inst->search_provider, provider) != 0) {
+        start_next = 0;
+        next_provider[0] = '\0';
+        next_query[0] = '\0';
+        if (inst->queued_search_pending &&
+            inst->queued_search_provider[0] != '\0' &&
+            inst->queued_search_query[0] != '\0') {
+            snprintf(next_provider, sizeof(next_provider), "%s", inst->queued_search_provider);
+            snprintf(next_query, sizeof(next_query), "%s", inst->queued_search_query);
+            inst->queued_search_pending = false;
+            inst->queued_search_provider[0] = '\0';
+            inst->queued_search_query[0] = '\0';
+            start_next = 1;
+        } else {
+            inst->search_thread_running = false;
+        }
+        pthread_mutex_unlock(&inst->search_mutex);
+
+        if (start_next) {
+            pthread_mutex_lock(&inst->search_mutex);
+            if (spawn_search_thread_locked(inst, next_provider, next_query) == 0) {
+                snprintf(log_msg,
+                         sizeof(log_msg),
+                         "starting queued search provider=%s query=%s",
+                         next_provider,
+                         next_query);
+                yt_log(log_msg);
+            }
+            pthread_mutex_unlock(&inst->search_mutex);
+        }
+        return NULL;
+    }
 
     inst->search_elapsed_ms = elapsed_ms;
     inst->search_count = local_count;
@@ -1021,7 +1266,8 @@ static void* search_thread_main(void *arg) {
     }
     snprintf(log_msg,
              sizeof(log_msg),
-             "search finished status=%s rc=%d count=%d elapsed_ms=%llu err=%s",
+             "search finished provider=%s status=%s rc=%d count=%d elapsed_ms=%llu err=%s",
+             provider,
              inst->search_status,
              rc,
              local_count,
@@ -1030,10 +1276,15 @@ static void* search_thread_main(void *arg) {
     yt_log(log_msg);
 
     start_next = 0;
+    next_provider[0] = '\0';
     next_query[0] = '\0';
-    if (inst->queued_search_pending && inst->queued_search_query[0] != '\0') {
+    if (inst->queued_search_pending &&
+        inst->queued_search_provider[0] != '\0' &&
+        inst->queued_search_query[0] != '\0') {
+        snprintf(next_provider, sizeof(next_provider), "%s", inst->queued_search_provider);
         snprintf(next_query, sizeof(next_query), "%s", inst->queued_search_query);
         inst->queued_search_pending = false;
+        inst->queued_search_provider[0] = '\0';
         inst->queued_search_query[0] = '\0';
         start_next = 1;
     } else {
@@ -1043,10 +1294,11 @@ static void* search_thread_main(void *arg) {
 
     if (start_next) {
         pthread_mutex_lock(&inst->search_mutex);
-        if (spawn_search_thread_locked(inst, next_query) == 0) {
+        if (spawn_search_thread_locked(inst, next_provider, next_query) == 0) {
             snprintf(log_msg,
                      sizeof(log_msg),
-                     "starting queued search query=%s",
+                     "starting queued search provider=%s query=%s",
+                     next_provider,
                      next_query);
             yt_log(log_msg);
         }
@@ -1057,7 +1309,11 @@ static void* search_thread_main(void *arg) {
 }
 
 static int start_search_async(yt_instance_t *inst, const char *query) {
+    char provider[PROVIDER_MAX];
+
     if (!inst || !query || query[0] == '\0') return -1;
+
+    normalize_provider_value(inst->search_provider, provider, sizeof(provider));
 
     if (inst->search_thread_valid && !inst->search_thread_running) {
         pthread_join(inst->search_thread, NULL);
@@ -1065,16 +1321,18 @@ static int start_search_async(yt_instance_t *inst, const char *query) {
     }
 
     if (inst->search_thread_running) {
+        snprintf(inst->queued_search_provider, sizeof(inst->queued_search_provider), "%s", provider);
         snprintf(inst->queued_search_query, sizeof(inst->queued_search_query), "%s", query);
         inst->queued_search_pending = true;
         set_search_status(inst, "queued", "search queued");
         return 1;
     }
 
-    return spawn_search_thread_locked(inst, query);
+    return spawn_search_thread_locked(inst, provider, query);
 }
 
 static int resolve_stream_url_daemon(yt_instance_t *inst,
+                                     const char *provider,
                                      const char *source_url,
                                      char *media_url,
                                      size_t media_url_len,
@@ -1084,12 +1342,15 @@ static int resolve_stream_url_daemon(yt_instance_t *inst,
                                      size_t referer_len,
                                      char *err,
                                      size_t err_len) {
-    char req[STREAM_URL_MAX + 16];
+    char clean_provider[PROVIDER_MAX];
+    char req[STREAM_URL_MAX + PROVIDER_MAX + 16];
     char line[DAEMON_LINE_MAX];
     char *fields[5];
     int field_count;
 
-    if (!inst || !source_url || !media_url || media_url_len == 0) return -1;
+    if (!inst || !provider || !source_url || !media_url || media_url_len == 0) return -1;
+
+    normalize_provider_value(provider, clean_provider, sizeof(clean_provider));
 
     pthread_mutex_lock(&inst->daemon_mutex);
     if (start_daemon_locked(inst, err, err_len) != 0) {
@@ -1097,7 +1358,7 @@ static int resolve_stream_url_daemon(yt_instance_t *inst,
         return -1;
     }
 
-    snprintf(req, sizeof(req), "RESOLVE\t%s\n", source_url);
+    snprintf(req, sizeof(req), "RESOLVE\t%s\t%s\n", clean_provider, source_url);
     if (fputs(req, inst->daemon_in) == EOF || fflush(inst->daemon_in) != 0) {
         if (err && err_len > 0) snprintf(err, err_len, "daemon write failed");
         stop_daemon_locked(inst);
@@ -1184,6 +1445,7 @@ static int resolve_stream_url_legacy(const yt_instance_t *inst,
 }
 
 static int resolve_stream_url(yt_instance_t *inst,
+                              const char *provider,
                               const char *source_url,
                               char *media_url,
                               size_t media_url_len,
@@ -1194,6 +1456,7 @@ static int resolve_stream_url(yt_instance_t *inst,
                               char *err,
                               size_t err_len) {
     return resolve_stream_url_daemon(inst,
+                                     provider,
                                      source_url,
                                      media_url,
                                      media_url_len,
@@ -1207,6 +1470,7 @@ static int resolve_stream_url(yt_instance_t *inst,
 
 static void* resolve_thread_main(void *arg) {
     yt_instance_t *inst = (yt_instance_t *)arg;
+    char source_provider[PROVIDER_MAX];
     char source_url[STREAM_URL_MAX];
     char media_url[STREAM_URL_MAX];
     char user_agent[HTTP_HEADER_MAX];
@@ -1218,14 +1482,20 @@ static void* resolve_thread_main(void *arg) {
     if (!inst) return NULL;
 
     pthread_mutex_lock(&inst->resolve_mutex);
+    snprintf(source_provider, sizeof(source_provider), "%s", inst->stream_provider);
     snprintf(source_url, sizeof(source_url), "%s", inst->stream_url);
     pthread_mutex_unlock(&inst->resolve_mutex);
+    infer_provider_from_url(source_url, source_provider, sizeof(source_provider));
+    normalize_provider_value(source_provider, source_provider, sizeof(source_provider));
+    snprintf(log_msg, sizeof(log_msg), "resolve started provider=%s url=%s", source_provider, source_url);
+    yt_log(log_msg);
 
     media_url[0] = '\0';
     user_agent[0] = '\0';
     referer[0] = '\0';
     err[0] = '\0';
     rc = resolve_stream_url(inst,
+                            source_provider,
                             source_url,
                             media_url,
                             sizeof(media_url),
@@ -1237,7 +1507,9 @@ static void* resolve_thread_main(void *arg) {
                             sizeof(err));
 
     pthread_mutex_lock(&inst->resolve_mutex);
-    if (strcmp(inst->stream_url, source_url) == 0 && source_url[0] != '\0') {
+    if (strcmp(inst->stream_provider, source_provider) == 0 &&
+        strcmp(inst->stream_url, source_url) == 0 &&
+        source_url[0] != '\0') {
         if (rc == 0) {
             inst->resolve_ready = true;
             inst->resolve_failed = false;
@@ -1255,9 +1527,10 @@ static void* resolve_thread_main(void *arg) {
     pthread_mutex_unlock(&inst->resolve_mutex);
 
     if (rc == 0) {
-        yt_log("resolve finished");
+        snprintf(log_msg, sizeof(log_msg), "resolve finished provider=%s", source_provider);
+        yt_log(log_msg);
     } else {
-        snprintf(log_msg, sizeof(log_msg), "resolve failed: %s", err[0] ? err : "unknown");
+        snprintf(log_msg, sizeof(log_msg), "resolve failed provider=%s: %s", source_provider, err[0] ? err : "unknown");
         yt_log(log_msg);
     }
 
@@ -1346,7 +1619,9 @@ static void pump_pipe(yt_instance_t *inst) {
             continue;
         }
         if (n == 0) {
-            if (inst->active_stream_resolved && !inst->resolved_fallback_attempted) {
+            if (inst->active_stream_resolved &&
+                !inst->resolved_fallback_attempted &&
+                supports_legacy_fallback(inst)) {
                 pthread_mutex_lock(&inst->resolve_mutex);
                 inst->resolve_ready = false;
                 inst->resolve_failed = true;
@@ -1368,7 +1643,9 @@ static void pump_pipe(yt_instance_t *inst) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             break;
         }
-        if (inst->active_stream_resolved && !inst->resolved_fallback_attempted) {
+        if (inst->active_stream_resolved &&
+            !inst->resolved_fallback_attempted &&
+            supports_legacy_fallback(inst)) {
             pthread_mutex_lock(&inst->resolve_mutex);
             inst->resolve_ready = false;
             inst->resolve_failed = true;
@@ -1396,9 +1673,12 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     if (!inst) return NULL;
 
     snprintf(inst->module_dir, sizeof(inst->module_dir), "%s", module_dir ? module_dir : ".");
+    snprintf(inst->stream_provider, sizeof(inst->stream_provider), "youtube");
+    snprintf(inst->search_provider, sizeof(inst->search_provider), "youtube");
     inst->stream_url[0] = '\0';
     inst->gain = 1.0f;
     inst->pipe_fd = -1;
+    inst->stream_pid = -1;
     inst->daemon_pid = -1;
 
     pthread_mutex_init(&inst->search_mutex, NULL);
@@ -1490,6 +1770,7 @@ static bool allow_trigger(uint64_t *last_ms, uint64_t debounce_ms) {
 
 static void v2_set_param(void *instance, const char *key, const char *val) {
     yt_instance_t *inst = (yt_instance_t *)instance;
+    char log_msg[384];
     if (!inst || !key || !val) return;
 
     if (strcmp(key, "gain") == 0) {
@@ -1502,6 +1783,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
     if (strcmp(key, "stream_url") == 0) {
         char clean_url[STREAM_URL_MAX];
+        char clean_provider[PROVIDER_MAX];
         if (val[0] == '\0') {
             stop_everything(inst);
             return;
@@ -1512,8 +1794,12 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             return;
         }
 
+        snprintf(clean_provider, sizeof(clean_provider), "%s", inst->stream_provider);
+        infer_provider_from_url(clean_url, clean_provider, sizeof(clean_provider));
+        normalize_provider_value(clean_provider, clean_provider, sizeof(clean_provider));
         snprintf(inst->stream_url, sizeof(inst->stream_url), "%s", clean_url);
         pthread_mutex_lock(&inst->resolve_mutex);
+        snprintf(inst->stream_provider, sizeof(inst->stream_provider), "%s", clean_provider);
         inst->resolve_ready = false;
         inst->resolve_failed = false;
         inst->resolved_media_url[0] = '\0';
@@ -1521,8 +1807,28 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         inst->resolved_referer[0] = '\0';
         inst->resolve_error[0] = '\0';
         pthread_mutex_unlock(&inst->resolve_mutex);
+        snprintf(log_msg, sizeof(log_msg), "stream_url set provider=%s url=%s", clean_provider, clean_url);
+        yt_log(log_msg);
         restart_stream_from_beginning(inst, 0);
-        (void)start_resolve_async(inst);
+        if (prefer_legacy_pipeline(inst)) {
+            snprintf(log_msg, sizeof(log_msg), "stream_url using legacy pipeline provider=%s", clean_provider);
+            yt_log(log_msg);
+            if (start_stream_legacy(inst) != 0) {
+                inst->stream_eof = true;
+                inst->restart_countdown = 0;
+            }
+        } else {
+            (void)start_resolve_async(inst);
+        }
+        return;
+    }
+
+    if (strcmp(key, "stream_provider") == 0) {
+        char clean_provider[PROVIDER_MAX];
+        normalize_provider_value(val, clean_provider, sizeof(clean_provider));
+        pthread_mutex_lock(&inst->resolve_mutex);
+        snprintf(inst->stream_provider, sizeof(inst->stream_provider), "%s", clean_provider);
+        pthread_mutex_unlock(&inst->resolve_mutex);
         return;
     }
 
@@ -1560,7 +1866,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(key, "restart") == 0) {
         if (inst->stream_url[0] != '\0') {
             restart_stream_from_beginning(inst, 0);
-            (void)start_resolve_async(inst);
+            if (prefer_legacy_pipeline(inst)) {
+                if (start_stream_legacy(inst) != 0) {
+                    inst->stream_eof = true;
+                    inst->restart_countdown = 0;
+                }
+            } else {
+                (void)start_resolve_async(inst);
+            }
         }
         return;
     }
@@ -1570,7 +1883,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (allow_trigger(&inst->last_restart_ms, DEBOUNCE_RESTART_MS) &&
                 inst->stream_url[0] != '\0') {
                 restart_stream_from_beginning(inst, 0);
-                (void)start_resolve_async(inst);
+                if (prefer_legacy_pipeline(inst)) {
+                    if (start_stream_legacy(inst) != 0) {
+                        inst->stream_eof = true;
+                        inst->restart_countdown = 0;
+                    }
+                } else {
+                    (void)start_resolve_async(inst);
+                }
             }
         }
         return;
@@ -1600,8 +1920,22 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
     if (strcmp(key, "search_query") == 0) {
         pthread_mutex_lock(&inst->search_mutex);
-        (void)start_search_async(inst, val);
+        if (val[0] == '\0') {
+            clear_search_locked(inst);
+        } else {
+            (void)start_search_async(inst, val);
+        }
         pthread_mutex_unlock(&inst->search_mutex);
+        return;
+    }
+
+    if (strcmp(key, "search_provider") == 0) {
+        char clean_provider[PROVIDER_MAX];
+        normalize_provider_value(val, clean_provider, sizeof(clean_provider));
+        pthread_mutex_lock(&inst->search_mutex);
+        snprintf(inst->search_provider, sizeof(inst->search_provider), "%s", clean_provider);
+        pthread_mutex_unlock(&inst->search_mutex);
+        return;
     }
 }
 
@@ -1645,6 +1979,9 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "stream_url") == 0) {
         return snprintf(buf, (size_t)buf_len, "%s", inst ? inst->stream_url : "");
     }
+    if (strcmp(key, "stream_provider") == 0) {
+        return snprintf(buf, (size_t)buf_len, "%s", inst ? inst->stream_provider : "youtube");
+    }
     if (strcmp(key, "stream_status") == 0) {
         size_t avail;
         if (!inst) return snprintf(buf, (size_t)buf_len, "stopped");
@@ -1672,6 +2009,13 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         int ret;
         pthread_mutex_lock(&inst->search_mutex);
         ret = snprintf(buf, (size_t)buf_len, "%s", inst->search_query);
+        pthread_mutex_unlock(&inst->search_mutex);
+        return ret;
+    }
+    if (inst && strcmp(key, "search_provider") == 0) {
+        int ret;
+        pthread_mutex_lock(&inst->search_mutex);
+        ret = snprintf(buf, (size_t)buf_len, "%s", inst->search_provider);
         pthread_mutex_unlock(&inst->search_mutex);
         return ret;
     }
@@ -1730,6 +2074,15 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             int ret = -1;
             pthread_mutex_lock(&inst->search_mutex);
             if (idx < inst->search_count) ret = snprintf(buf, (size_t)buf_len, "%s", inst->search_results[idx].url);
+            pthread_mutex_unlock(&inst->search_mutex);
+            return ret;
+        }
+
+        idx = get_result_index(key, "search_result_provider_");
+        if (idx >= 0) {
+            int ret = -1;
+            pthread_mutex_lock(&inst->search_mutex);
+            if (idx < inst->search_count) ret = snprintf(buf, (size_t)buf_len, "%s", inst->search_results[idx].provider);
             pthread_mutex_unlock(&inst->search_mutex);
             return ret;
         }
