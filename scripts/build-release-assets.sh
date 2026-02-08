@@ -12,10 +12,10 @@ if [ ! -d build/deps/bin ]; then
 fi
 
 echo "=== Building release asset: with bundled runtime ==="
-BUNDLE_RUNTIME=with-deps OUTPUT_BASENAME=yt-module ./scripts/build.sh
+BUNDLE_RUNTIME=with-deps OUTPUT_BASENAME=webstream-module ./scripts/build.sh
 
 echo "=== Building release asset: core-only (user-supplied runtime) ==="
-BUNDLE_RUNTIME=core-only OUTPUT_BASENAME=yt-module-core ./scripts/build.sh
+BUNDLE_RUNTIME=core-only OUTPUT_BASENAME=webstream-module-core ./scripts/build.sh
 
 echo "=== Release assets ready ==="
-ls -lh dist/yt-module*.tar.gz
+ls -lh dist/webstream-module*.tar.gz

@@ -28,8 +28,8 @@ jobs:
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           REL_VERSION=$(jq -r '.version' release.json)
-          EXPECTED_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${TAG_VERSION}/yt-module.tar.gz"
-          EXPECTED_URL_CORE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${TAG_VERSION}/yt-module-core.tar.gz"
+          EXPECTED_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${TAG_VERSION}/webstream-module.tar.gz"
+          EXPECTED_URL_CORE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${TAG_VERSION}/webstream-module-core.tar.gz"
           REL_URL=$(jq -r '.download_url' release.json)
           REL_URL_CORE=$(jq -r '.download_url_core // empty' release.json)
           if [ "$REL_VERSION" != "$TAG_VERSION" ]; then
@@ -58,7 +58,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            dist/yt-module.tar.gz
-            dist/yt-module-core.tar.gz
+            dist/webstream-module.tar.gz
+            dist/webstream-module-core.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

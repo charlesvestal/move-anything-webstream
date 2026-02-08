@@ -1,4 +1,4 @@
-# Building move-anything-yt
+# Building move-anything-webstream
 
 This module is a **v2 DSP plugin** that relies on three runtime binaries bundled with the module:
 
@@ -10,7 +10,7 @@ Target runtime: Ableton Move (`aarch64` Linux, glibc)
 
 ## Output Layout
 
-Build output in `dist/yt/`:
+Build output in `dist/webstream/`:
 
 - `module.json`
 - `ui.js`
@@ -26,8 +26,8 @@ Build output in `dist/yt/`:
 
 Release tarball:
 
-- `dist/yt-module.tar.gz`
-- `dist/yt-module-core.tar.gz` (core-only variant, for release builds)
+- `dist/webstream-module.tar.gz`
+- `dist/webstream-module-core.tar.gz` (core-only variant, for release builds)
 
 ## 1) Build yt-dlp for Move
 
@@ -113,10 +113,10 @@ This script creates:
 What it does:
 
 - Cross-compiles `src/dsp/yt_stream_plugin.c` to `dsp.so` for `aarch64`
-- Packages module files to `dist/yt/`
-- If `build/deps/bin` exists, bundles runtime binaries into `dist/yt/bin/`
+- Packages module files to `dist/webstream/`
+- If `build/deps/bin` exists, bundles runtime binaries into `dist/webstream/bin/`
 - Copies third-party notices/licenses into the module
-- Creates `dist/yt-module.tar.gz` by default
+- Creates `dist/webstream-module.tar.gz` by default
 
 Force profile selection:
 
@@ -141,11 +141,11 @@ Build both release assets:
 Manual deploy equivalent:
 
 ```bash
-scp dist/yt-module.tar.gz ableton@move.local:~/move-anything/
+scp dist/webstream-module.tar.gz ableton@move.local:~/move-anything/
 ssh ableton@move.local '
   cd ~/move-anything &&
   mkdir -p modules/sound_generators &&
-  tar -xzf yt-module.tar.gz -C modules/sound_generators/
+  tar -xzf webstream-module.tar.gz -C modules/sound_generators/
 '
 ```
 
@@ -155,17 +155,17 @@ On Move:
 
 ```bash
 ssh ableton@move.local '
-  ls -l ~/move-anything/modules/sound_generators/yt/dsp.so
-  ls -l ~/move-anything/modules/sound_generators/yt/bin/yt-dlp
-  ls -l ~/move-anything/modules/sound_generators/yt/bin/deno
-  ls -l ~/move-anything/modules/sound_generators/yt/bin/ffmpeg
+  ls -l ~/move-anything/modules/sound_generators/webstream/dsp.so
+  ls -l ~/move-anything/modules/sound_generators/webstream/bin/yt-dlp
+  ls -l ~/move-anything/modules/sound_generators/webstream/bin/deno
+  ls -l ~/move-anything/modules/sound_generators/webstream/bin/ffmpeg
 '
 ```
 
 Optional architecture check:
 
 ```bash
-file dist/yt/dsp.so
+file dist/webstream/dsp.so
 # Expect: ELF 64-bit LSB shared object, ARM aarch64
 ```
 

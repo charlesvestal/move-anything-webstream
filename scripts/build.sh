@@ -3,12 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-IMAGE_NAME="move-anything-yt-builder"
+IMAGE_NAME="move-anything-webstream-builder"
 BUNDLE_RUNTIME="${BUNDLE_RUNTIME:-auto}"   # auto | with-deps | core-only
-OUTPUT_BASENAME="${OUTPUT_BASENAME:-yt-module}"
+OUTPUT_BASENAME="${OUTPUT_BASENAME:-webstream-module}"
 
 if [ -z "${CROSS_PREFIX:-}" ] && [ ! -f "/.dockerenv" ]; then
-  echo "=== YT Module Build (via Docker) ==="
+  echo "=== Webstream Module Build (via Docker) ==="
   if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     docker build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile" "$REPO_ROOT"
   fi
@@ -50,8 +50,8 @@ if [ "$bundle_deps" -eq 1 ] && [ ! -d "$REPO_ROOT/build/deps/bin" ]; then
 fi
 
 cd "$REPO_ROOT"
-rm -rf build/module dist/yt
-mkdir -p build/module dist/yt
+rm -rf build/module dist/webstream
+mkdir -p build/module dist/webstream
 
 echo "Compiling v2 DSP plugin..."
 "${CROSS_PREFIX}gcc" -O3 -g -shared -fPIC \
@@ -60,45 +60,45 @@ echo "Compiling v2 DSP plugin..."
   -Isrc/dsp \
   -lpthread -lm
 
-cat src/module.json > dist/yt/module.json
-cat src/ui.js > dist/yt/ui.js
-cat src/ui_chain.js > dist/yt/ui_chain.js
-cat build/module/dsp.so > dist/yt/dsp.so
-chmod +x dist/yt/dsp.so
+cat src/module.json > dist/webstream/module.json
+cat src/ui.js > dist/webstream/ui.js
+cat src/ui_chain.js > dist/webstream/ui_chain.js
+cat build/module/dsp.so > dist/webstream/dsp.so
+chmod +x dist/webstream/dsp.so
 
-printf '%s\n' "$BUNDLE_RUNTIME" > dist/yt/runtime_profile.txt
+printf '%s\n' "$BUNDLE_RUNTIME" > dist/webstream/runtime_profile.txt
 
-mkdir -p dist/yt/bin
-cp src/bin/yt_dlp_daemon.py dist/yt/bin/yt_dlp_daemon.py
-chmod +x dist/yt/bin/yt_dlp_daemon.py
+mkdir -p dist/webstream/bin
+cp src/bin/yt_dlp_daemon.py dist/webstream/bin/yt_dlp_daemon.py
+chmod +x dist/webstream/bin/yt_dlp_daemon.py
 
 if [ "$bundle_deps" -eq 1 ]; then
   echo "Bundling runtime dependencies..."
-  cp build/deps/bin/yt-dlp dist/yt/bin/yt-dlp
-  cp build/deps/bin/deno dist/yt/bin/deno
-  cp build/deps/bin/ffmpeg dist/yt/bin/ffmpeg
-  cp build/deps/bin/ffprobe dist/yt/bin/ffprobe
-  chmod +x dist/yt/bin/*
+  cp build/deps/bin/yt-dlp dist/webstream/bin/yt-dlp
+  cp build/deps/bin/deno dist/webstream/bin/deno
+  cp build/deps/bin/ffmpeg dist/webstream/bin/ffmpeg
+  cp build/deps/bin/ffprobe dist/webstream/bin/ffprobe
+  chmod +x dist/webstream/bin/*
 else
   echo "Building core-only artifact (runtime binaries are user-supplied)"
 fi
 
 if [ -f THIRD_PARTY_NOTICES.md ]; then
-  cp THIRD_PARTY_NOTICES.md dist/yt/THIRD_PARTY_NOTICES.md
+  cp THIRD_PARTY_NOTICES.md dist/webstream/THIRD_PARTY_NOTICES.md
 fi
 if [ -d licenses ]; then
-  rm -rf dist/yt/licenses
-  cp -R licenses dist/yt/licenses
+  rm -rf dist/webstream/licenses
+  cp -R licenses dist/webstream/licenses
 fi
 if [ -f build/deps/manifest.json ]; then
-  cp build/deps/manifest.json dist/yt/THIRD_PARTY_MANIFEST.json
+  cp build/deps/manifest.json dist/webstream/THIRD_PARTY_MANIFEST.json
 fi
 
 (
   cd dist
-  tar -czvf "${OUTPUT_BASENAME}.tar.gz" yt/
+  tar -czvf "${OUTPUT_BASENAME}.tar.gz" webstream/
 )
 
 echo "=== Build Complete ==="
-echo "Module dir: dist/yt"
+echo "Module dir: dist/webstream"
 echo "Tarball: dist/${OUTPUT_BASENAME}.tar.gz"

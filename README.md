@@ -1,6 +1,6 @@
-# YT Stream Module (Move Anything)
+# Webstream Module (Move Anything)
 
-Experimental v2 sound-generator module for streamed audio playback via `yt-dlp` backends.
+Experimental v2 sound-generator module for web audio playback via provider backends (YouTube via `yt-dlp` first).
 
 Third-party, unsupported community module. Not affiliated with or endorsed by Ableton or YouTube.
 
@@ -29,8 +29,8 @@ Release assets (both variants):
 ./scripts/build-release-assets.sh
 ```
 
-- `dist/yt-module.tar.gz` bundles runtime dependencies.
-- `dist/yt-module-core.tar.gz` is core-only (user supplies `yt-dlp`/`deno`/`ffmpeg`).
+- `dist/webstream-module.tar.gz` bundles runtime dependencies.
+- `dist/webstream-module-core.tar.gz` is core-only (user supplies `yt-dlp`/`deno`/`ffmpeg`).
 
 ## Install
 

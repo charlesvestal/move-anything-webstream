@@ -1,9 +1,9 @@
 {
-  "id": "yt",
-  "name": "YT Stream",
-  "abbrev": "YT",
+  "id": "webstream",
+  "name": "Webstream",
+  "abbrev": "WS",
   "version": "0.1.1",
-  "description": "Experimental streamed audio generator using yt-dlp + ffmpeg",
+  "description": "Web audio search and streaming generator with provider backends",
   "author": "charlesvestal",
   "license": "MIT",
   "ui": "ui.js",

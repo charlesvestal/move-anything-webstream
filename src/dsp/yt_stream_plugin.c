@@ -124,7 +124,7 @@ typedef struct {
 static void yt_log(const char *msg) {
     if (g_host && g_host->log) {
         char buf[384];
-        snprintf(buf, sizeof(buf), "[yt] %s", msg);
+        snprintf(buf, sizeof(buf), "[ws] %s", msg);
         g_host->log(buf);
     }
 }
@@ -1640,7 +1640,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, (size_t)buf_len, "idle");
     }
     if (strcmp(key, "preset_name") == 0 || strcmp(key, "name") == 0) {
-        return snprintf(buf, (size_t)buf_len, "YT Stream");
+        return snprintf(buf, (size_t)buf_len, "Webstream");
     }
     if (strcmp(key, "stream_url") == 0) {
         return snprintf(buf, (size_t)buf_len, "%s", inst ? inst->stream_url : "");
@@ -1882,6 +1882,6 @@ static plugin_api_v2_t g_plugin_api_v2 = {
 
 plugin_api_v2_t* move_plugin_init_v2(const host_api_v1_t *host) {
     g_host = host;
-    yt_log("yt stream plugin v2 initialized");
+    yt_log("webstream plugin v2 initialized");
     return &g_plugin_api_v2;
 }

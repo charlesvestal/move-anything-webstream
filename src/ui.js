@@ -25,7 +25,8 @@ import { drawStackMenu } from '/data/UserData/move-anything/shared/menu_render.m
 
 const MAX_MENU_RESULTS = 20;
 const MAX_SEARCH_HISTORY = 20;
-const SEARCH_HISTORY_PATH = '/data/UserData/move-anything/yt_search_history.json';
+const SEARCH_HISTORY_PATH = '/data/UserData/move-anything/webstream_search_history.json';
+const LEGACY_SEARCH_HISTORY_PATH = '/data/UserData/move-anything/yt_search_history.json';
 const SPINNER = ['-', '/', '|', '\\'];
 
 let searchQuery = '';
@@ -136,8 +137,16 @@ function writeTextFile(path, content) {
 }
 
 function loadSearchHistoryFromDisk() {
+  let raw = null;
+  let fromLegacy = false;
+
   try {
-    const raw = std.loadFile(SEARCH_HISTORY_PATH);
+    raw = std.loadFile(SEARCH_HISTORY_PATH);
+    if (!raw) {
+      raw = std.loadFile(LEGACY_SEARCH_HISTORY_PATH);
+      fromLegacy = !!raw;
+    }
+
     if (!raw) {
       searchHistory = [];
       return;
@@ -158,6 +167,10 @@ function loadSearchHistoryFromDisk() {
       if (next.length >= MAX_SEARCH_HISTORY) break;
     }
     searchHistory = next;
+
+    if (fromLegacy) {
+      saveSearchHistoryToDisk();
+    }
   } catch (e) {
     searchHistory = [];
   }

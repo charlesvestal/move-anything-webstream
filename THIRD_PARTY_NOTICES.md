@@ -29,7 +29,7 @@ This repository contains original module code plus optional third-party runtime 
 ## Distribution Notes
 
 - This project can build two release artifacts:
-  - `yt-module.tar.gz` (bundled runtime binaries)
-  - `yt-module-core.tar.gz` (core-only, runtime binaries are user-supplied)
+  - `webstream-module.tar.gz` (bundled runtime binaries)
+  - `webstream-module-core.tar.gz` (core-only, runtime binaries are user-supplied)
 - Distributors and users are responsible for complying with applicable licenses and the terms/policies of content sources.
 - This project is a third-party community module and is not affiliated with or endorsed by Ableton, YouTube, or other content platforms.

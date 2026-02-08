@@ -29,7 +29,7 @@ if ! rg -q "THIRD_PARTY_NOTICES.md" "$ROOT_DIR/scripts/build.sh"; then
   fail=1
 fi
 
-if ! rg -q "yt-module-core.tar.gz" "$ROOT_DIR/.github/workflows/release.yml"; then
+if ! rg -q "webstream-module-core.tar.gz" "$ROOT_DIR/.github/workflows/release.yml"; then
   echo "FAIL: release workflow should publish a core-only asset"
   fail=1
 fi

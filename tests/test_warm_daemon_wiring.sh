@@ -14,7 +14,7 @@ if [[ ! -f "$DAEMON_SRC" ]]; then
 fi
 
 if ! rg -q "yt_dlp_daemon.py" "$BUILD_SH"; then
-  echo "FAIL: scripts/build.sh should package yt_dlp_daemon.py into dist/yt/bin/"
+  echo "FAIL: scripts/build.sh should package yt_dlp_daemon.py into dist/webstream/bin/"
   fail=1
 fi
 
