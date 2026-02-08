@@ -25,8 +25,9 @@ import { drawStackMenu } from '/data/UserData/move-anything/shared/menu_render.m
 
 const MAX_MENU_RESULTS = 20;
 const MAX_SEARCH_HISTORY = 20;
-const SEARCH_HISTORY_PATH = '/data/UserData/move-anything/webstream_search_history.json';
-const LEGACY_SEARCH_HISTORY_PATH = '/data/UserData/move-anything/yt_search_history.json';
+const SEARCH_HISTORY_PATH = '/data/UserData/move-anything/config/webstream_search_history.json';
+const LEGACY_SEARCH_HISTORY_PATH = '/data/UserData/move-anything/webstream_search_history.json';
+const LEGACY_SEARCH_HISTORY_PATH_2 = '/data/UserData/move-anything/yt_search_history.json';
 const SPINNER = ['-', '/', '|', '\\'];
 
 let searchQuery = '';
@@ -144,6 +145,9 @@ function loadSearchHistoryFromDisk() {
     raw = std.loadFile(SEARCH_HISTORY_PATH);
     if (!raw) {
       raw = std.loadFile(LEGACY_SEARCH_HISTORY_PATH);
+      if (!raw) {
+        raw = std.loadFile(LEGACY_SEARCH_HISTORY_PATH_2);
+      }
       fromLegacy = !!raw;
     }
 

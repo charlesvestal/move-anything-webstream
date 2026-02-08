@@ -16,13 +16,18 @@ if ! rg -q "from 'os'" "$UI_JS"; then
   fail=1
 fi
 
-if ! rg -q "const SEARCH_HISTORY_PATH = '/data/UserData/move-anything/webstream_search_history.json'" "$UI_JS"; then
+if ! rg -q "const SEARCH_HISTORY_PATH = '/data/UserData/move-anything/config/webstream_search_history.json'" "$UI_JS"; then
   echo "FAIL: ui.js should define shared on-disk history path"
   fail=1
 fi
 
-if ! rg -q "const LEGACY_SEARCH_HISTORY_PATH = '/data/UserData/move-anything/yt_search_history.json'" "$UI_JS"; then
-  echo "FAIL: ui.js should define legacy history path migration source"
+if ! rg -q "const LEGACY_SEARCH_HISTORY_PATH = '/data/UserData/move-anything/webstream_search_history.json'" "$UI_JS"; then
+  echo "FAIL: ui.js should define root-level webstream history migration source"
+  fail=1
+fi
+
+if ! rg -q "const LEGACY_SEARCH_HISTORY_PATH_2 = '/data/UserData/move-anything/yt_search_history.json'" "$UI_JS"; then
+  echo "FAIL: ui.js should define root-level yt history migration source"
   fail=1
 fi
 
