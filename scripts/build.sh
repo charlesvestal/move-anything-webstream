@@ -68,9 +68,12 @@ chmod +x dist/yt/dsp.so
 
 printf '%s\n' "$BUNDLE_RUNTIME" > dist/yt/runtime_profile.txt
 
+mkdir -p dist/yt/bin
+cp src/bin/yt_dlp_daemon.py dist/yt/bin/yt_dlp_daemon.py
+chmod +x dist/yt/bin/yt_dlp_daemon.py
+
 if [ "$bundle_deps" -eq 1 ]; then
   echo "Bundling runtime dependencies..."
-  mkdir -p dist/yt/bin
   cp build/deps/bin/yt-dlp dist/yt/bin/yt-dlp
   cp build/deps/bin/deno dist/yt/bin/deno
   cp build/deps/bin/ffmpeg dist/yt/bin/ffmpeg

@@ -7,7 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "plugin_api_v1.h"
@@ -25,11 +29,18 @@
 #define SEARCH_ID_MAX 32
 #define SEARCH_TEXT_MAX 192
 #define SEARCH_URL_MAX 160
-#define STREAM_URL_MAX 1024
+#define STREAM_URL_MAX 4096
+#define HTTP_HEADER_MAX 384
+#define DAEMON_LINE_MAX 4096
+#define DAEMON_START_TIMEOUT_MS 12000
+#define DAEMON_SEARCH_TIMEOUT_MS 12000
+#define DAEMON_RESOLVE_TIMEOUT_MS 12000
 
 static const host_api_v1_t *g_host = NULL;
 
 static void* search_thread_main(void *arg);
+static void* resolve_thread_main(void *arg);
+static void* warmup_thread_main(void *arg);
 
 typedef struct {
     char id[SEARCH_ID_MAX];
@@ -48,6 +59,8 @@ typedef struct {
     int pipe_fd;
     bool stream_eof;
     int restart_countdown;
+    bool active_stream_resolved;
+    bool resolved_fallback_attempted;
 
     int16_t ring[RING_SAMPLES];
     size_t write_pos;
@@ -72,6 +85,25 @@ typedef struct {
     uint64_t last_stop_ms;
     uint64_t last_restart_ms;
     bool warmup_started;
+    pthread_t warmup_thread;
+    bool warmup_thread_valid;
+
+    pthread_mutex_t daemon_mutex;
+    FILE *daemon_in;
+    FILE *daemon_out;
+    pid_t daemon_pid;
+    bool daemon_ready;
+
+    pthread_mutex_t resolve_mutex;
+    pthread_t resolve_thread;
+    bool resolve_thread_valid;
+    bool resolve_thread_running;
+    bool resolve_ready;
+    bool resolve_failed;
+    char resolved_media_url[STREAM_URL_MAX];
+    char resolved_user_agent[HTTP_HEADER_MAX];
+    char resolved_referer[HTTP_HEADER_MAX];
+    char resolve_error[256];
 
     float gain;
 
@@ -103,43 +135,194 @@ static uint64_t now_ms(void) {
     return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
 }
 
-typedef struct {
-    char cmd[1536];
-} warmup_ctx_t;
+static void trim_line_end(char *line) {
+    size_t len;
+    if (!line) return;
+    len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+        line[len - 1] = '\0';
+        len--;
+    }
+}
+
+static int split_tab_fields(char *line, char **fields, int max_fields) {
+    int count = 0;
+    char *p = line;
+    if (!line || !fields || max_fields <= 0) return 0;
+    fields[count++] = p;
+    while (*p && count < max_fields) {
+        if (*p == '\t') {
+            *p = '\0';
+            fields[count++] = p + 1;
+        }
+        p++;
+    }
+    return count;
+}
+
+static void stop_daemon_locked(yt_instance_t *inst) {
+    int status;
+    pid_t rc;
+
+    if (!inst) return;
+
+    if (inst->daemon_in) {
+        fprintf(inst->daemon_in, "QUIT\n");
+        fflush(inst->daemon_in);
+        fclose(inst->daemon_in);
+        inst->daemon_in = NULL;
+    }
+
+    if (inst->daemon_out) {
+        fclose(inst->daemon_out);
+        inst->daemon_out = NULL;
+    }
+
+    if (inst->daemon_pid > 0) {
+        rc = waitpid(inst->daemon_pid, &status, WNOHANG);
+        if (rc == 0) {
+            (void)kill(inst->daemon_pid, SIGTERM);
+            usleep(200000);
+            rc = waitpid(inst->daemon_pid, &status, WNOHANG);
+            if (rc == 0) {
+                (void)kill(inst->daemon_pid, SIGKILL);
+                (void)waitpid(inst->daemon_pid, &status, 0);
+            }
+        }
+        inst->daemon_pid = -1;
+    }
+
+    inst->daemon_ready = false;
+}
+
+static int read_daemon_line_locked(yt_instance_t *inst, char *line, size_t line_len, int timeout_ms) {
+    struct pollfd pfd;
+    int rc;
+
+    if (!inst || !inst->daemon_out || !line || line_len < 2) return -1;
+    pfd.fd = fileno(inst->daemon_out);
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    rc = poll(&pfd, 1, timeout_ms);
+    if (rc <= 0) return -1;
+    if (!(pfd.revents & POLLIN)) return -1;
+
+    if (!fgets(line, (int)line_len, inst->daemon_out)) {
+        return -1;
+    }
+    trim_line_end(line);
+    return 0;
+}
+
+static int start_daemon_locked(yt_instance_t *inst, char *err, size_t err_len) {
+    int parent_to_child[2];
+    int child_to_parent[2];
+    pid_t pid;
+    char daemon_path[1024];
+    char ytdlp_path[1024];
+    char line[DAEMON_LINE_MAX];
+
+    if (!inst) return -1;
+    if (inst->daemon_ready && inst->daemon_in && inst->daemon_out && inst->daemon_pid > 0) {
+        return 0;
+    }
+
+    stop_daemon_locked(inst);
+
+    if (pipe(parent_to_child) != 0 || pipe(child_to_parent) != 0) {
+        if (err && err_len > 0) snprintf(err, err_len, "daemon pipe failed");
+        return -1;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        close(parent_to_child[0]);
+        close(parent_to_child[1]);
+        close(child_to_parent[0]);
+        close(child_to_parent[1]);
+        if (err && err_len > 0) snprintf(err, err_len, "daemon fork failed");
+        return -1;
+    }
+
+    if (pid == 0) {
+        snprintf(daemon_path, sizeof(daemon_path), "%s/bin/yt_dlp_daemon.py", inst->module_dir);
+        snprintf(ytdlp_path, sizeof(ytdlp_path), "%s/bin/yt-dlp", inst->module_dir);
+
+        dup2(parent_to_child[0], STDIN_FILENO);
+        dup2(child_to_parent[1], STDOUT_FILENO);
+        close(parent_to_child[0]);
+        close(parent_to_child[1]);
+        close(child_to_parent[0]);
+        close(child_to_parent[1]);
+        execlp("python3", "python3", daemon_path, ytdlp_path, (char *)NULL);
+        _exit(127);
+    }
+
+    close(parent_to_child[0]);
+    close(child_to_parent[1]);
+    inst->daemon_in = fdopen(parent_to_child[1], "w");
+    inst->daemon_out = fdopen(child_to_parent[0], "r");
+    inst->daemon_pid = pid;
+    if (!inst->daemon_in || !inst->daemon_out) {
+        if (err && err_len > 0) snprintf(err, err_len, "daemon fdopen failed");
+        stop_daemon_locked(inst);
+        return -1;
+    }
+
+    setvbuf(inst->daemon_in, NULL, _IOLBF, 0);
+    setvbuf(inst->daemon_out, NULL, _IOLBF, 0);
+
+    if (read_daemon_line_locked(inst, line, sizeof(line), DAEMON_START_TIMEOUT_MS) != 0) {
+        if (err && err_len > 0) snprintf(err, err_len, "daemon startup timeout");
+        stop_daemon_locked(inst);
+        return -1;
+    }
+
+    if (strcmp(line, "READY") != 0) {
+        if (err && err_len > 0) snprintf(err, err_len, "daemon startup failed: %s", line);
+        stop_daemon_locked(inst);
+        return -1;
+    }
+
+    inst->daemon_ready = true;
+    return 0;
+}
+
+static int ensure_daemon_started(yt_instance_t *inst, char *err, size_t err_len) {
+    int rc;
+    if (!inst) return -1;
+    pthread_mutex_lock(&inst->daemon_mutex);
+    rc = start_daemon_locked(inst, err, err_len);
+    pthread_mutex_unlock(&inst->daemon_mutex);
+    return rc;
+}
 
 static void* warmup_thread_main(void *arg) {
-    warmup_ctx_t *ctx = (warmup_ctx_t *)arg;
-    if (!ctx) return NULL;
-    (void)system(ctx->cmd);
-    free(ctx);
+    yt_instance_t *inst = (yt_instance_t *)arg;
+    char err[256];
+    if (!inst) return NULL;
+    err[0] = '\0';
+    if (ensure_daemon_started(inst, err, sizeof(err)) == 0) {
+        yt_log("yt-dlp daemon warmed");
+    } else {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "yt-dlp daemon warmup failed: %s", err[0] ? err : "unknown");
+        yt_log(msg);
+    }
     return NULL;
 }
 
 static void start_warmup_if_needed(yt_instance_t *inst) {
-    pthread_t tid;
-    warmup_ctx_t *ctx;
-
     if (!inst || inst->warmup_started) return;
     inst->warmup_started = true;
 
-    ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) return;
-
-    snprintf(ctx->cmd,
-             sizeof(ctx->cmd),
-             "/bin/sh -lc '"
-             "\"%s/bin/yt-dlp\" --version >/dev/null 2>&1 || true; "
-             "\"%s/bin/ffmpeg\" -version >/dev/null 2>&1 || true'",
-             inst->module_dir,
-             inst->module_dir);
-
-    if (pthread_create(&tid, NULL, warmup_thread_main, ctx) == 0) {
-        pthread_detach(tid);
-        yt_log("started dependency warmup thread");
-        return;
+    if (pthread_create(&inst->warmup_thread, NULL, warmup_thread_main, inst) == 0) {
+        inst->warmup_thread_valid = true;
+        yt_log("started yt-dlp daemon warmup thread");
+    } else {
+        inst->warmup_thread_valid = false;
     }
-
-    free(ctx);
 }
 
 static void set_error(yt_instance_t *inst, const char *msg) {
@@ -218,7 +401,8 @@ static void sanitize_display_text(char *s) {
 static bool is_allowed_stream_url_char(unsigned char c) {
     if (isalnum(c)) return true;
     return c == ':' || c == '/' || c == '?' || c == '&' || c == '=' || c == '%' ||
-           c == '.' || c == '_' || c == '-' || c == '+' || c == '#' || c == '~';
+           c == '.' || c == '_' || c == '-' || c == '+' || c == '#' || c == '~' ||
+           c == ',';
 }
 
 static bool host_is_supported(const char *host) {
@@ -282,6 +466,40 @@ static bool sanitize_stream_url(const char *in, char *out, size_t out_len) {
     }
     out[j] = '\0';
     return j > 0;
+}
+
+static bool sanitize_any_http_url(const char *in, char *out, size_t out_len) {
+    size_t i;
+    size_t j = 0;
+    if (!in || !out || out_len == 0) return false;
+    if (!(strncmp(in, "https://", 8) == 0 || strncmp(in, "http://", 7) == 0)) {
+        return false;
+    }
+    for (i = 0; in[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (!is_allowed_stream_url_char(c)) return false;
+        if (j + 1 >= out_len) return false;
+        out[j++] = (char)c;
+    }
+    out[j] = '\0';
+    return j > 0;
+}
+
+static void sanitize_header_text(const char *in, char *out, size_t out_len) {
+    size_t i;
+    size_t j = 0;
+    if (!out || out_len == 0) return;
+    if (!in) {
+        out[0] = '\0';
+        return;
+    }
+    for (i = 0; in[i] != '\0' && j + 1 < out_len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c < 32 || c > 126) continue;
+        if (c == '"' || c == '\'' || c == '\\' || c == '`') continue;
+        out[j++] = (char)c;
+    }
+    out[j] = '\0';
 }
 
 static uint64_t ring_oldest_abs(const yt_instance_t *inst) {
@@ -369,6 +587,8 @@ static void restart_stream_from_beginning(yt_instance_t *inst, size_t discard_sa
     inst->paused = false;
     inst->played_samples = 0;
     inst->seek_discard_samples = discard_samples;
+    inst->active_stream_resolved = false;
+    inst->resolved_fallback_attempted = false;
 }
 
 static void seek_relative_seconds(yt_instance_t *inst, long delta_sec) {
@@ -401,13 +621,23 @@ static void stop_everything(yt_instance_t *inst) {
     inst->paused = false;
     inst->played_samples = 0;
     inst->seek_discard_samples = 0;
+    inst->active_stream_resolved = false;
+    inst->resolved_fallback_attempted = false;
     stop_stream(inst);
     clear_ring(inst);
     clear_error(inst);
+    pthread_mutex_lock(&inst->resolve_mutex);
+    inst->resolve_ready = false;
+    inst->resolve_failed = false;
+    inst->resolved_media_url[0] = '\0';
+    inst->resolved_user_agent[0] = '\0';
+    inst->resolved_referer[0] = '\0';
+    inst->resolve_error[0] = '\0';
+    pthread_mutex_unlock(&inst->resolve_mutex);
 }
 
-static int start_stream(yt_instance_t *inst) {
-    char cmd[4096];
+static int start_stream_legacy(yt_instance_t *inst) {
+    char cmd[8192];
 
     stop_stream(inst);
 
@@ -447,7 +677,66 @@ static int start_stream(yt_instance_t *inst) {
     inst->stream_eof = false;
     inst->restart_countdown = 0;
     inst->prime_needed_samples = (size_t)MOVE_SAMPLE_RATE; /* ~0.5s stereo */
-    yt_log("stream pipeline started");
+    inst->active_stream_resolved = false;
+    yt_log("stream pipeline started (legacy)");
+    return 0;
+}
+
+static int start_stream_resolved(yt_instance_t *inst, const char *media_url) {
+    char cmd[8192];
+    char clean_url[STREAM_URL_MAX];
+
+    if (!inst || !media_url || media_url[0] == '\0') {
+        set_error(inst, "resolved media url missing");
+        return -1;
+    }
+
+    if (!sanitize_any_http_url(media_url, clean_url, sizeof(clean_url))) {
+        set_error(inst, "resolved media url invalid");
+        return -1;
+    }
+
+    stop_stream(inst);
+
+    snprintf(cmd,
+             sizeof(cmd),
+             "/bin/sh -lc '"
+             "exec \"%s/bin/ffmpeg\" -hide_banner -loglevel error "
+             "-i \"%s\" -vn -sn -dn "
+             "-af \"aresample=%d:async=1:min_hard_comp=0.100:first_pts=0\" "
+             "-f s16le -ac 2 -ar %d pipe:1'",
+             inst->module_dir,
+             clean_url,
+             MOVE_SAMPLE_RATE,
+             MOVE_SAMPLE_RATE);
+
+    inst->pipe = popen(cmd, "r");
+    if (!inst->pipe) {
+        set_error(inst, "failed to launch ffmpeg pipeline");
+        return -1;
+    }
+
+    inst->pipe_fd = fileno(inst->pipe);
+    if (inst->pipe_fd < 0) {
+        set_error(inst, "failed to get ffmpeg fd");
+        pclose(inst->pipe);
+        inst->pipe = NULL;
+        return -1;
+    }
+
+    if (fcntl(inst->pipe_fd, F_SETFL, fcntl(inst->pipe_fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
+        set_error(inst, "failed to set ffmpeg non-blocking mode");
+        pclose(inst->pipe);
+        inst->pipe = NULL;
+        return -1;
+    }
+
+    clear_error(inst);
+    inst->stream_eof = false;
+    inst->restart_countdown = 0;
+    inst->prime_needed_samples = (size_t)MOVE_SAMPLE_RATE; /* ~0.5s stereo */
+    inst->active_stream_resolved = true;
+    yt_log("stream pipeline started (resolved)");
     return 0;
 }
 
@@ -497,14 +786,14 @@ static int parse_search_line(const char *line_in, search_result_t *out) {
     return 0;
 }
 
-static int run_search_command(const yt_instance_t *inst,
-                              const char *query,
-                              search_result_t *results,
-                              int *out_count,
-                              char *err,
-                              size_t err_len) {
+static int run_search_command_legacy(const yt_instance_t *inst,
+                                     const char *query,
+                                     search_result_t *results,
+                                     int *out_count,
+                                     char *err,
+                                     size_t err_len) {
     char clean_query[SEARCH_QUERY_MAX];
-    char cmd[4096];
+    char cmd[8192];
     FILE *fp;
     char line[4096];
     int count = 0;
@@ -552,6 +841,122 @@ static int run_search_command(const yt_instance_t *inst,
 
     if (err && err_len > 0) err[0] = '\0';
     return 0;
+}
+
+static int run_search_command_daemon(yt_instance_t *inst,
+                                     const char *query,
+                                     search_result_t *results,
+                                     int *out_count,
+                                     char *err,
+                                     size_t err_len) {
+    char clean_query[SEARCH_QUERY_MAX];
+    char req[SEARCH_QUERY_MAX + 64];
+    char line[DAEMON_LINE_MAX];
+    char *fields[6];
+    int field_count;
+    int count;
+    int attempt;
+    int timed_out;
+    bool retryable_timeout = false;
+
+    if (!inst || !query || !results || !out_count) {
+        if (err && err_len > 0) snprintf(err, err_len, "invalid search args");
+        return -1;
+    }
+
+    sanitize_query(query, clean_query, sizeof(clean_query));
+
+    pthread_mutex_lock(&inst->daemon_mutex);
+    for (attempt = 0; attempt < 2; attempt++) {
+        count = 0;
+        timed_out = 0;
+
+        if (start_daemon_locked(inst, err, err_len) != 0) {
+            pthread_mutex_unlock(&inst->daemon_mutex);
+            return -1;
+        }
+
+        snprintf(req, sizeof(req), "SEARCH\t%d\t%s\n", SEARCH_MAX_RESULTS, clean_query);
+        if (fputs(req, inst->daemon_in) == EOF || fflush(inst->daemon_in) != 0) {
+            if (err && err_len > 0) snprintf(err, err_len, "daemon write failed");
+            stop_daemon_locked(inst);
+            pthread_mutex_unlock(&inst->daemon_mutex);
+            return -1;
+        }
+
+        while (1) {
+            if (read_daemon_line_locked(inst, line, sizeof(line), DAEMON_SEARCH_TIMEOUT_MS) != 0) {
+                timed_out = 1;
+                retryable_timeout = true;
+                stop_daemon_locked(inst);
+                break;
+            }
+
+            field_count = split_tab_fields(line, fields, 6);
+            if (field_count <= 0 || !fields[0]) continue;
+
+            if (strcmp(fields[0], "SEARCH_BEGIN") == 0) {
+                continue;
+            }
+            if (strcmp(fields[0], "SEARCH_ITEM") == 0) {
+                if (count < SEARCH_MAX_RESULTS && field_count >= 3) {
+                    snprintf(results[count].id, sizeof(results[count].id), "%s", fields[1]);
+                    snprintf(results[count].title, sizeof(results[count].title), "%s", fields[2]);
+                    snprintf(results[count].channel, sizeof(results[count].channel), "%s", field_count >= 4 ? fields[3] : "");
+                    snprintf(results[count].duration, sizeof(results[count].duration), "%s", field_count >= 5 ? fields[4] : "");
+                    sanitize_display_text(results[count].title);
+                    sanitize_display_text(results[count].channel);
+                    sanitize_display_text(results[count].duration);
+                    snprintf(results[count].url,
+                             sizeof(results[count].url),
+                             "https://www.youtube.com/watch?v=%s",
+                             results[count].id);
+                    count++;
+                }
+                continue;
+            }
+            if (strcmp(fields[0], "SEARCH_END") == 0) {
+                *out_count = count;
+                if (count == 0) {
+                    if (err && err_len > 0) snprintf(err, err_len, "no results");
+                } else if (err && err_len > 0) {
+                    err[0] = '\0';
+                }
+                pthread_mutex_unlock(&inst->daemon_mutex);
+                return 0;
+            }
+            if (strcmp(fields[0], "ERROR") == 0) {
+                if (err && err_len > 0) snprintf(err, err_len, "%s", field_count >= 2 ? fields[1] : "daemon search failed");
+                pthread_mutex_unlock(&inst->daemon_mutex);
+                return -1;
+            }
+        }
+
+        if (!timed_out) break;
+        if (attempt == 0) {
+            yt_log("search timeout; restarting daemon and retrying once");
+        }
+    }
+
+    if (retryable_timeout) {
+        if (err && err_len > 0) snprintf(err, err_len, "daemon search timeout");
+        *out_count = 0;
+        pthread_mutex_unlock(&inst->daemon_mutex);
+        return -1;
+    }
+
+    pthread_mutex_unlock(&inst->daemon_mutex);
+    if (err && err_len > 0) snprintf(err, err_len, "daemon search failed");
+    return -1;
+}
+
+static int run_search_command(yt_instance_t *inst,
+                              const char *query,
+                              search_result_t *results,
+                              int *out_count,
+                              char *err,
+                              size_t err_len) {
+    return run_search_command_daemon(inst, query, results, out_count, err, err_len);
 }
 
 /* Caller must hold search_mutex. */
@@ -669,6 +1074,236 @@ static int start_search_async(yt_instance_t *inst, const char *query) {
     return spawn_search_thread_locked(inst, query);
 }
 
+static int resolve_stream_url_daemon(yt_instance_t *inst,
+                                     const char *source_url,
+                                     char *media_url,
+                                     size_t media_url_len,
+                                     char *user_agent,
+                                     size_t user_agent_len,
+                                     char *referer,
+                                     size_t referer_len,
+                                     char *err,
+                                     size_t err_len) {
+    char req[STREAM_URL_MAX + 16];
+    char line[DAEMON_LINE_MAX];
+    char *fields[5];
+    int field_count;
+
+    if (!inst || !source_url || !media_url || media_url_len == 0) return -1;
+
+    pthread_mutex_lock(&inst->daemon_mutex);
+    if (start_daemon_locked(inst, err, err_len) != 0) {
+        pthread_mutex_unlock(&inst->daemon_mutex);
+        return -1;
+    }
+
+    snprintf(req, sizeof(req), "RESOLVE\t%s\n", source_url);
+    if (fputs(req, inst->daemon_in) == EOF || fflush(inst->daemon_in) != 0) {
+        if (err && err_len > 0) snprintf(err, err_len, "daemon write failed");
+        stop_daemon_locked(inst);
+        pthread_mutex_unlock(&inst->daemon_mutex);
+        return -1;
+    }
+
+    if (read_daemon_line_locked(inst, line, sizeof(line), DAEMON_RESOLVE_TIMEOUT_MS) != 0) {
+        if (err && err_len > 0) snprintf(err, err_len, "daemon resolve timeout");
+        stop_daemon_locked(inst);
+        pthread_mutex_unlock(&inst->daemon_mutex);
+        return -1;
+    }
+
+    field_count = split_tab_fields(line, fields, 5);
+    if (field_count >= 2 && strcmp(fields[0], "RESOLVE_OK") == 0) {
+        if (!sanitize_any_http_url(fields[1], media_url, media_url_len)) {
+            if (err && err_len > 0) snprintf(err, err_len, "daemon resolve url invalid");
+            pthread_mutex_unlock(&inst->daemon_mutex);
+            return -1;
+        }
+        sanitize_header_text(field_count >= 3 ? fields[2] : "", user_agent, user_agent_len);
+        sanitize_header_text(field_count >= 4 ? fields[3] : "", referer, referer_len);
+        if (err && err_len > 0) err[0] = '\0';
+        pthread_mutex_unlock(&inst->daemon_mutex);
+        return 0;
+    }
+
+    if (field_count >= 2 && strcmp(fields[0], "ERROR") == 0) {
+        if (err && err_len > 0) snprintf(err, err_len, "%s", fields[1]);
+    } else if (err && err_len > 0) {
+        snprintf(err, err_len, "daemon resolve failed");
+    }
+    pthread_mutex_unlock(&inst->daemon_mutex);
+    return -1;
+}
+
+static int resolve_stream_url_legacy(const yt_instance_t *inst,
+                                     const char *source_url,
+                                     char *media_url,
+                                     size_t media_url_len,
+                                     char *err,
+                                     size_t err_len) {
+    char cmd[8192];
+    FILE *fp;
+    char line[DAEMON_LINE_MAX];
+    int rc;
+
+    if (!inst || !source_url || !media_url || media_url_len == 0) return -1;
+
+    snprintf(cmd,
+             sizeof(cmd),
+             "/bin/sh -lc \"\\\"%s/bin/yt-dlp\\\" --no-playlist "
+             "--extractor-args 'youtube:player_skip=js' "
+             "-f 'bestaudio[ext=m4a]/bestaudio' -g "
+             "\\\"%s\\\" 2>/dev/null\"",
+             inst->module_dir,
+             source_url);
+
+    fp = popen(cmd, "r");
+    if (!fp) {
+        if (err && err_len > 0) snprintf(err, err_len, "failed to start legacy resolve");
+        return -1;
+    }
+
+    line[0] = '\0';
+    if (!fgets(line, sizeof(line), fp)) {
+        rc = pclose(fp);
+        if (err && err_len > 0) snprintf(err, err_len, "legacy resolve empty (rc=%d)", rc);
+        return -1;
+    }
+    rc = pclose(fp);
+    trim_line_end(line);
+    if (rc != 0) {
+        if (err && err_len > 0) snprintf(err, err_len, "legacy resolve failed");
+        return -1;
+    }
+    if (!sanitize_any_http_url(line, media_url, media_url_len)) {
+        if (err && err_len > 0) snprintf(err, err_len, "legacy resolve url invalid");
+        return -1;
+    }
+    if (err && err_len > 0) err[0] = '\0';
+    return 0;
+}
+
+static int resolve_stream_url(yt_instance_t *inst,
+                              const char *source_url,
+                              char *media_url,
+                              size_t media_url_len,
+                              char *user_agent,
+                              size_t user_agent_len,
+                              char *referer,
+                              size_t referer_len,
+                              char *err,
+                              size_t err_len) {
+    return resolve_stream_url_daemon(inst,
+                                     source_url,
+                                     media_url,
+                                     media_url_len,
+                                     user_agent,
+                                     user_agent_len,
+                                     referer,
+                                     referer_len,
+                                     err,
+                                     err_len);
+}
+
+static void* resolve_thread_main(void *arg) {
+    yt_instance_t *inst = (yt_instance_t *)arg;
+    char source_url[STREAM_URL_MAX];
+    char media_url[STREAM_URL_MAX];
+    char user_agent[HTTP_HEADER_MAX];
+    char referer[HTTP_HEADER_MAX];
+    char err[256];
+    int rc;
+    char log_msg[320];
+
+    if (!inst) return NULL;
+
+    pthread_mutex_lock(&inst->resolve_mutex);
+    snprintf(source_url, sizeof(source_url), "%s", inst->stream_url);
+    pthread_mutex_unlock(&inst->resolve_mutex);
+
+    media_url[0] = '\0';
+    user_agent[0] = '\0';
+    referer[0] = '\0';
+    err[0] = '\0';
+    rc = resolve_stream_url(inst,
+                            source_url,
+                            media_url,
+                            sizeof(media_url),
+                            user_agent,
+                            sizeof(user_agent),
+                            referer,
+                            sizeof(referer),
+                            err,
+                            sizeof(err));
+
+    pthread_mutex_lock(&inst->resolve_mutex);
+    if (strcmp(inst->stream_url, source_url) == 0 && source_url[0] != '\0') {
+        if (rc == 0) {
+            inst->resolve_ready = true;
+            inst->resolve_failed = false;
+            snprintf(inst->resolved_media_url, sizeof(inst->resolved_media_url), "%s", media_url);
+            snprintf(inst->resolved_user_agent, sizeof(inst->resolved_user_agent), "%s", user_agent);
+            snprintf(inst->resolved_referer, sizeof(inst->resolved_referer), "%s", referer);
+            inst->resolve_error[0] = '\0';
+        } else {
+            inst->resolve_ready = false;
+            inst->resolve_failed = true;
+            snprintf(inst->resolve_error, sizeof(inst->resolve_error), "%s", err[0] ? err : "resolve failed");
+        }
+    }
+    inst->resolve_thread_running = false;
+    pthread_mutex_unlock(&inst->resolve_mutex);
+
+    if (rc == 0) {
+        yt_log("resolve finished");
+    } else {
+        snprintf(log_msg, sizeof(log_msg), "resolve failed: %s", err[0] ? err : "unknown");
+        yt_log(log_msg);
+    }
+
+    return NULL;
+}
+
+static int start_resolve_async(yt_instance_t *inst) {
+    if (!inst) return -1;
+
+    pthread_mutex_lock(&inst->resolve_mutex);
+    if (inst->stream_url[0] == '\0') {
+        pthread_mutex_unlock(&inst->resolve_mutex);
+        return -1;
+    }
+
+    if (inst->resolve_thread_valid && !inst->resolve_thread_running) {
+        pthread_join(inst->resolve_thread, NULL);
+        inst->resolve_thread_valid = false;
+    }
+
+    if (inst->resolve_thread_running) {
+        pthread_mutex_unlock(&inst->resolve_mutex);
+        return 1;
+    }
+
+    inst->resolve_ready = false;
+    inst->resolve_failed = false;
+    inst->resolved_media_url[0] = '\0';
+    inst->resolved_user_agent[0] = '\0';
+    inst->resolved_referer[0] = '\0';
+    inst->resolve_error[0] = '\0';
+    inst->resolve_thread_running = true;
+
+    if (pthread_create(&inst->resolve_thread, NULL, resolve_thread_main, inst) != 0) {
+        inst->resolve_thread_running = false;
+        inst->resolve_failed = true;
+        snprintf(inst->resolve_error, sizeof(inst->resolve_error), "failed to start resolve thread");
+        pthread_mutex_unlock(&inst->resolve_mutex);
+        return -1;
+    }
+
+    inst->resolve_thread_valid = true;
+    pthread_mutex_unlock(&inst->resolve_mutex);
+    return 0;
+}
+
 static void pump_pipe(yt_instance_t *inst) {
     uint8_t buf[4096];
     uint8_t merged[4100];
@@ -711,6 +1346,19 @@ static void pump_pipe(yt_instance_t *inst) {
             continue;
         }
         if (n == 0) {
+            if (inst->active_stream_resolved && !inst->resolved_fallback_attempted) {
+                pthread_mutex_lock(&inst->resolve_mutex);
+                inst->resolve_ready = false;
+                inst->resolve_failed = true;
+                pthread_mutex_unlock(&inst->resolve_mutex);
+                inst->resolved_fallback_attempted = true;
+                set_error(inst, "resolved stream ended, falling back");
+                stop_stream(inst);
+                clear_ring(inst);
+                inst->stream_eof = false;
+                inst->restart_countdown = 0;
+                break;
+            }
             inst->stream_eof = true;
             set_error(inst, "stream ended");
             stop_stream(inst);
@@ -718,6 +1366,19 @@ static void pump_pipe(yt_instance_t *inst) {
             break;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            break;
+        }
+        if (inst->active_stream_resolved && !inst->resolved_fallback_attempted) {
+            pthread_mutex_lock(&inst->resolve_mutex);
+            inst->resolve_ready = false;
+            inst->resolve_failed = true;
+            pthread_mutex_unlock(&inst->resolve_mutex);
+            inst->resolved_fallback_attempted = true;
+            set_error(inst, "resolved stream read error, falling back");
+            stop_stream(inst);
+            clear_ring(inst);
+            inst->stream_eof = false;
+            inst->restart_countdown = 0;
             break;
         }
         inst->stream_eof = true;
@@ -737,8 +1398,12 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     snprintf(inst->module_dir, sizeof(inst->module_dir), "%s", module_dir ? module_dir : ".");
     inst->stream_url[0] = '\0';
     inst->gain = 1.0f;
+    inst->pipe_fd = -1;
+    inst->daemon_pid = -1;
 
     pthread_mutex_init(&inst->search_mutex, NULL);
+    pthread_mutex_init(&inst->daemon_mutex, NULL);
+    pthread_mutex_init(&inst->resolve_mutex, NULL);
     snprintf(inst->search_status, sizeof(inst->search_status), "idle");
     (void)json_defaults;
     start_warmup_if_needed(inst);
@@ -748,9 +1413,26 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
 
 static void v2_destroy_instance(void *instance) {
     yt_instance_t *inst = (yt_instance_t *)instance;
+    pid_t daemon_pid_snapshot;
     if (!inst) return;
 
     stop_stream(inst);
+
+    daemon_pid_snapshot = inst->daemon_pid;
+    if (daemon_pid_snapshot > 0) {
+        (void)kill(daemon_pid_snapshot, SIGTERM);
+    }
+
+    if (inst->warmup_thread_valid) {
+        pthread_join(inst->warmup_thread, NULL);
+        inst->warmup_thread_valid = false;
+    }
+
+    if (inst->resolve_thread_valid) {
+        pthread_join(inst->resolve_thread, NULL);
+        inst->resolve_thread_valid = false;
+        inst->resolve_thread_running = false;
+    }
 
     if (inst->search_thread_valid) {
         pthread_join(inst->search_thread, NULL);
@@ -758,6 +1440,12 @@ static void v2_destroy_instance(void *instance) {
         inst->search_thread_running = false;
     }
 
+    pthread_mutex_lock(&inst->daemon_mutex);
+    stop_daemon_locked(inst);
+    pthread_mutex_unlock(&inst->daemon_mutex);
+
+    pthread_mutex_destroy(&inst->resolve_mutex);
+    pthread_mutex_destroy(&inst->daemon_mutex);
     pthread_mutex_destroy(&inst->search_mutex);
     free(inst);
 }
@@ -825,7 +1513,16 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         }
 
         snprintf(inst->stream_url, sizeof(inst->stream_url), "%s", clean_url);
+        pthread_mutex_lock(&inst->resolve_mutex);
+        inst->resolve_ready = false;
+        inst->resolve_failed = false;
+        inst->resolved_media_url[0] = '\0';
+        inst->resolved_user_agent[0] = '\0';
+        inst->resolved_referer[0] = '\0';
+        inst->resolve_error[0] = '\0';
+        pthread_mutex_unlock(&inst->resolve_mutex);
         restart_stream_from_beginning(inst, 0);
+        (void)start_resolve_async(inst);
         return;
     }
 
@@ -863,6 +1560,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(key, "restart") == 0) {
         if (inst->stream_url[0] != '\0') {
             restart_stream_from_beginning(inst, 0);
+            (void)start_resolve_async(inst);
         }
         return;
     }
@@ -872,6 +1570,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (allow_trigger(&inst->last_restart_ms, DEBOUNCE_RESTART_MS) &&
                 inst->stream_url[0] != '\0') {
                 restart_stream_from_beginning(inst, 0);
+                (void)start_resolve_async(inst);
             }
         }
         return;
@@ -1089,11 +1788,54 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     }
 
     if (!inst->pipe) {
+        bool resolve_ready = false;
+        bool resolve_failed = false;
+        bool resolve_running = false;
+        char resolved_media_url[STREAM_URL_MAX];
+
+        resolved_media_url[0] = '\0';
         if (inst->restart_countdown > 0) {
             inst->restart_countdown--;
-        } else if (start_stream(inst) != 0) {
-            inst->stream_eof = true;
-            inst->restart_countdown = 0;
+        } else {
+            pthread_mutex_lock(&inst->resolve_mutex);
+            resolve_ready = inst->resolve_ready;
+            resolve_failed = inst->resolve_failed;
+            resolve_running = inst->resolve_thread_running;
+            if (resolve_ready) {
+                snprintf(resolved_media_url, sizeof(resolved_media_url), "%s", inst->resolved_media_url);
+            }
+            pthread_mutex_unlock(&inst->resolve_mutex);
+
+            if (resolve_ready) {
+                if (start_stream_resolved(inst, resolved_media_url) != 0) {
+                    pthread_mutex_lock(&inst->resolve_mutex);
+                    inst->resolve_ready = false;
+                    inst->resolve_failed = true;
+                    pthread_mutex_unlock(&inst->resolve_mutex);
+                    resolve_failed = true;
+                }
+            } else if (resolve_failed) {
+                /* Resolve failed in background; fail over to legacy stream pipeline now. */
+            } else if (!resolve_running) {
+                if (start_resolve_async(inst) < 0) {
+                    resolve_failed = true;
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+
+            if (!inst->pipe && resolve_failed) {
+                if (start_stream_legacy(inst) != 0) {
+                    inst->stream_eof = true;
+                    inst->restart_countdown = 0;
+                } else {
+                    pthread_mutex_lock(&inst->resolve_mutex);
+                    inst->resolve_failed = false;
+                    pthread_mutex_unlock(&inst->resolve_mutex);
+                }
+            }
         }
     }
 

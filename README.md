@@ -12,7 +12,7 @@ Third-party, unsupported community module. Not affiliated with or endorsed by Ab
   - `[Previous searches]`
   - search results list
 - Starts streaming when a result is selected
-- Uses `yt-dlp` + `ffmpeg` pipeline to decode to 44.1kHz stereo `s16le`
+- Uses a warm `yt-dlp` daemon for search/URL resolve, then `ffmpeg` decode to 44.1kHz stereo `s16le`
 - Supports transport controls (play/pause, seek ±15s, stop, restart) via mapped knobs
 
 ## Build

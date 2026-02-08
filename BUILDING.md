@@ -16,6 +16,7 @@ Build output in `dist/yt/`:
 - `ui.js`
 - `dsp.so`
 - `bin/yt-dlp` (optional, if deps built)
+- `bin/yt_dlp_daemon.py` (always bundled; warm helper process for yt-dlp)
 - `bin/deno` (optional)
 - `bin/ffmpeg` (optional)
 - `bin/ffprobe` (optional)
