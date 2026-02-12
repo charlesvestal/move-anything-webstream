@@ -4,7 +4,5 @@
   "download_url_core": "https://github.com/charlesvestal/move-anything-webstream/releases/download/v0.2.0/webstream-module-core.tar.gz",
   "name": "Webstream",
   "description": "Web audio search and streaming generator with bundled yt-dlp/ffmpeg runtime.",
-  "requires": "",
-  "post_install": "",
   "repo_url": "https://github.com/charlesvestal/move-anything-webstream"
 }
