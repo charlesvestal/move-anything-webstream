@@ -42,7 +42,7 @@ if ! rg -q "loadSearchHistoryFromDisk\\(" "$UI_JS"; then
 fi
 
 if ! awk '
-  /function submitSearch\(query\)/ { in_fn=1; depth=0; next }
+  /function submitSearch\(/ { in_fn=1; depth=0; next }
   in_fn {
     if (index($0, "{") > 0) depth++
     if ($0 ~ /saveSearchHistoryToDisk\(\)/) found=1
