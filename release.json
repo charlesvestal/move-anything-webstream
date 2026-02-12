@@ -5,6 +5,6 @@
   "name": "Webstream",
   "description": "Web audio search and streaming generator with bundled yt-dlp/ffmpeg runtime.",
   "requires": "",
-  "post_install": "No extra install steps required. Open Webstream and choose [New Search...] to start playback.",
+  "post_install": "",
   "repo_url": "https://github.com/charlesvestal/move-anything-webstream"
 }
