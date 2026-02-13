@@ -2,7 +2,7 @@
   "id": "webstream",
   "name": "Webstream",
   "abbrev": "WS",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Web audio search and streaming generator with provider backends",
   "author": "charlesvestal",
   "license": "MIT",
@@ -22,21 +22,30 @@
         "key": "play_pause_step",
         "name": "Play/Pause",
         "type": "enum",
-        "options": ["idle", "trigger"],
+        "options": [
+          "idle",
+          "trigger"
+        ],
         "default": "idle"
       },
       {
         "key": "rewind_15_step",
         "name": "Rewind 15s",
         "type": "enum",
-        "options": ["idle", "trigger"],
+        "options": [
+          "idle",
+          "trigger"
+        ],
         "default": "idle"
       },
       {
         "key": "forward_15_step",
         "name": "Forward 15s",
         "type": "enum",
-        "options": ["idle", "trigger"],
+        "options": [
+          "idle",
+          "trigger"
+        ],
         "default": "idle"
       },
       {
@@ -52,14 +61,20 @@
         "key": "stop_step",
         "name": "Stop",
         "type": "enum",
-        "options": ["idle", "trigger"],
+        "options": [
+          "idle",
+          "trigger"
+        ],
         "default": "idle"
       },
       {
         "key": "restart_step",
         "name": "Restart",
         "type": "enum",
-        "options": ["idle", "trigger"],
+        "options": [
+          "idle",
+          "trigger"
+        ],
         "default": "idle"
       }
     ]
