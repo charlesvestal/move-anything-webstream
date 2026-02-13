@@ -1,7 +1,7 @@
 {
-  "version": "0.2.0",
-  "download_url": "https://github.com/charlesvestal/move-anything-webstream/releases/download/v0.2.0/webstream-module.tar.gz",
-  "download_url_core": "https://github.com/charlesvestal/move-anything-webstream/releases/download/v0.2.0/webstream-module-core.tar.gz",
+  "version": "0.2.1",
+  "download_url": "https://github.com/charlesvestal/move-anything-webstream/releases/download/v0.2.1/webstream-module.tar.gz",
+  "download_url_core": "https://github.com/charlesvestal/move-anything-webstream/releases/download/v0.2.1/webstream-module-core.tar.gz",
   "name": "Webstream",
   "description": "Web audio search and streaming generator with bundled yt-dlp/ffmpeg runtime.",
   "repo_url": "https://github.com/charlesvestal/move-anything-webstream"
