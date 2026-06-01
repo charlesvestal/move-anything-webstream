@@ -254,7 +254,8 @@ def resolve_request_ytdlp(yt_dlp_mod, provider: str, source_url: str) -> None:
     if isinstance(headers, dict):
         user_agent = headers.get("User-Agent") or ""
         referer = headers.get("Referer") or ""
-    write_fields("RESOLVE_OK", media_url, user_agent, referer)
+    title = clean_field(data.get("title") or "")
+    write_fields("RESOLVE_OK", media_url, user_agent, referer, title)
 
 
 def load_provider_config() -> dict:
@@ -424,7 +425,7 @@ def resolve_request_freesound(source_url: str, config: dict) -> None:
     if not media_url:
         raise RuntimeError("freesound preview url missing")
 
-    write_fields("RESOLVE_OK", media_url, "", "")
+    write_fields("RESOLVE_OK", media_url, "", "", "")
 
 
 def extract_archive_identifier(source: str) -> str:
@@ -572,7 +573,7 @@ def resolve_request_archive(source_url: str) -> None:
         urllib.parse.quote(identifier),
         urllib.parse.quote(name, safe="/"),
     )
-    write_fields("RESOLVE_OK", media_url, "", "")
+    write_fields("RESOLVE_OK", media_url, "", "", "")
 
 
 def search_request(yt_dlp_mod, provider: str, limit_text: str, query: str) -> None:
@@ -1050,6 +1051,61 @@ def parse_resolve_parts(parts: list):
     raise RuntimeError("RESOLVE requires provider+source url")
 
 
+def download_request(yt_dlp_mod, provider: str, source: str, output_path: str, ffmpeg_path: str = "") -> None:
+    """Download audio and convert to 16-bit 44.1kHz stereo WAV."""
+    ensure_ytdlp(yt_dlp_mod)
+    import subprocess
+    import glob as globmod
+
+    provider = normalize_provider(provider)
+    if not ffmpeg_path:
+        ffmpeg_path = "ffmpeg"
+
+    out_dir = os.path.dirname(output_path) or "/tmp"
+    tmp_template = os.path.join(out_dir, ".daemon_dl_tmp.%(ext)s")
+
+    opts = create_ytdlp_resolve_opts(provider)
+    opts["quiet"] = True
+    opts["no_warnings"] = True
+    opts["noplaylist"] = True
+    opts["outtmpl"] = {"default": tmp_template}
+
+    # Download
+    with yt_dlp_mod.YoutubeDL(opts) as ydl:
+        ydl.download([source])
+
+    # Find the temp file
+    pattern = os.path.join(out_dir, ".daemon_dl_tmp.*")
+    matches = globmod.glob(pattern)
+    if not matches:
+        raise RuntimeError("download produced no output file")
+    tmp_file = matches[0]
+
+    try:
+        # Convert to WAV
+        result = subprocess.run(
+            [ffmpeg_path, "-i", tmp_file, "-ar", "44100", "-ac", "2",
+             "-acodec", "pcm_s16le", "-y", output_path],
+            capture_output=True, timeout=300
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg exit {result.returncode}: {stderr[:200]}")
+    finally:
+        try:
+            os.remove(tmp_file)
+        except Exception:
+            pass
+        # Clean up any other temp files
+        for m in globmod.glob(pattern):
+            try:
+                os.remove(m)
+            except Exception:
+                pass
+
+    write_fields("DOWNLOAD_OK", output_path)
+
+
 def main() -> int:
     setup_import_path()
 
@@ -1107,6 +1163,15 @@ def main() -> int:
             elif cmd == "CRATEDIG_SEARCH":
                 count_text = parts[1] if len(parts) > 1 else "10"
                 cratedig_search(cratedig, count_text)
+            elif cmd == "DOWNLOAD":
+                if len(parts) < 4:
+                    write_fields("ERROR", "DOWNLOAD requires provider, source, output_path")
+                else:
+                    provider = parts[1]
+                    source = parts[2]
+                    output_path = parts[3]
+                    ffmpeg_path = parts[4] if len(parts) > 4 else ""
+                    download_request(yt_dlp_mod, provider, source, output_path, ffmpeg_path)
             elif cmd == "QUIT":
                 write_fields("BYE")
                 break
