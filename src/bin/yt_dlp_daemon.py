@@ -318,6 +318,12 @@ def provider_is_enabled(provider: str, config: dict) -> bool:
 
 
 def freesound_api_key(config: dict) -> str:
+    # Schwung-manager managed secret takes precedence, then env var, then the
+    # legacy provider config file.
+    secret = read_module_secret("freesound_api_key")
+    if secret:
+        return secret
+
     env_key = os.environ.get("FREESOUND_API_KEY") or os.environ.get("FREESOUND_TOKEN")
     if env_key:
         return env_key.strip()

@@ -46,7 +46,7 @@ Example:
 }
 ```
 
-FreeSound token can also be supplied via env var:
+The FreeSound API key can be set under **FreeSound API Key** on the Webstream module page in the Schwung manager (recommended; stored as a secret at `<module_dir>/secrets/freesound_api_key.txt`), via `webstream_providers.json` (above), or via env var:
 
 - `FREESOUND_API_KEY` (or `FREESOUND_TOKEN`)
 

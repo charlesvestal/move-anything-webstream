@@ -22,18 +22,20 @@ else
     echo "FAIL: settings-schema.json id should be \"webstream\""
     fail=1
   fi
-  if ! rg -q '"key"\s*:\s*"discogs_token"' "$SCHEMA"; then
-    echo "FAIL: settings-schema.json should declare a discogs_token field"
-    fail=1
-  fi
+  for key in discogs_token freesound_api_key; do
+    if ! rg -q "\"key\"\s*:\s*\"${key}\"" "$SCHEMA"; then
+      echo "FAIL: settings-schema.json should declare a ${key} field"
+      fail=1
+    fi
+  done
   if ! rg -q '"type"\s*:\s*"password"' "$SCHEMA"; then
-    echo "FAIL: discogs_token should be a password field"
+    echo "FAIL: secrets should be password fields"
     fail=1
   fi
 fi
 
-# Daemon reads the schwung-manager managed secret
-for token in read_module_secret "secrets" 'discogs_token'; do
+# Daemon reads the schwung-manager managed secrets
+for token in read_module_secret "secrets" 'discogs_token' 'freesound_api_key'; do
   if ! rg -Fq "$token" "$DAEMON_PY"; then
     echo "FAIL: daemon should reference ${token}"
     fail=1
