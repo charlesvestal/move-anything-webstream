@@ -272,6 +272,29 @@ def load_provider_config() -> dict:
     return {}
 
 
+def module_dir() -> str:
+    # The daemon runs from <module_dir>/bin/yt_dlp_daemon.py, so the module
+    # directory is two levels up. An env override keeps this testable.
+    override = os.environ.get("WEBSTREAM_MODULE_DIR")
+    if override:
+        return override
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def read_module_secret(key: str) -> str:
+    """Read a schwung-manager managed secret from <module_dir>/secrets/<key>.txt.
+
+    The schwung manager writes password-type settings (declared in
+    settings-schema.json) to this location, mode 0600. Returns "" when absent.
+    """
+    try:
+        path = os.path.join(module_dir(), "secrets", f"{key}.txt")
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
 def config_provider_block(config: dict, provider: str):
     if not isinstance(config, dict):
         return {}
@@ -1062,13 +1085,16 @@ def main() -> int:
 
     samplette = SampletteSession()
     config = load_provider_config()
-    discogs_token = ""
-    block = config_provider_block(config, "cratedig")
-    for k in ("token", "api_key"):
-        v = block.get(k)
-        if isinstance(v, str) and v.strip():
-            discogs_token = v.strip()
-            break
+    # Schwung-manager managed secret takes precedence, then legacy provider
+    # config file, then env var.
+    discogs_token = read_module_secret("discogs_token")
+    if not discogs_token:
+        block = config_provider_block(config, "cratedig")
+        for k in ("token", "api_key"):
+            v = block.get(k)
+            if isinstance(v, str) and v.strip():
+                discogs_token = v.strip()
+                break
     if not discogs_token:
         discogs_token = os.environ.get("DISCOGS_TOKEN", "").strip()
     cratedig = CrateDigSession(token=discogs_token)

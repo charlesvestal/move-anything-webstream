@@ -1,0 +1,13 @@
+{
+  "id": "webstream",
+  "label": "Webstream",
+  "items": [
+    {
+      "key": "discogs_token",
+      "label": "Discogs Token",
+      "type": "password",
+      "help": "Optional. Raises the Crate Dig rate limit from 25 to 60 requests/min. Generate a free personal access token at Discogs → Settings → Developers.",
+      "help_url": "https://www.discogs.com/settings/developers"
+    }
+  ]
+}

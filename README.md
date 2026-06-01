@@ -59,7 +59,9 @@ Works without a token (25 requests/min per device). For higher limits (60/min), 
 1. Create a Discogs account at [discogs.com](https://www.discogs.com/)
 2. Go to [Settings → Developers](https://www.discogs.com/settings/developers)
 3. Click "Generate new token"
-4. Add to `webstream_providers.json` (see above) or set `DISCOGS_TOKEN` env var
+4. Enter it under **Discogs Token** on the Webstream module page in the Schwung manager (recommended), or add it to `webstream_providers.json` (see above), or set the `DISCOGS_TOKEN` env var
+
+The Schwung manager stores the token as a secret at `<module_dir>/secrets/discogs_token.txt` (mode 0600), declared via the module's `settings-schema.json`. It takes precedence over `webstream_providers.json` and `DISCOGS_TOKEN`.
 
 Search results provided by [Discogs](https://www.discogs.com/).
 
