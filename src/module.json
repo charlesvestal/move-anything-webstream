@@ -2,7 +2,7 @@
   "id": "webstream",
   "name": "Webstream",
   "abbrev": "WS",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "min_host_version": "0.9.0",
   "description": "Web audio search and streaming generator with provider backends",
   "author": "charlesvestal",
