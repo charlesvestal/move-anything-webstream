@@ -21,6 +21,7 @@
     "chain_params": [
       {
         "key": "play_pause_step",
+        "short_name": "Pause",
         "name": "Play/Pause",
         "type": "enum",
         "options": [
@@ -31,6 +32,7 @@
       },
       {
         "key": "rewind_15_step",
+        "short_name": "Rewind",
         "name": "Rewind 15s",
         "type": "enum",
         "options": [
@@ -41,6 +43,7 @@
       },
       {
         "key": "forward_15_step",
+        "short_name": "Forward",
         "name": "Forward 15s",
         "type": "enum",
         "options": [
@@ -70,6 +73,7 @@
       },
       {
         "key": "restart_step",
+        "short_name": "RSTRT",
         "name": "Restart",
         "type": "enum",
         "options": [
